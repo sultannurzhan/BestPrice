@@ -186,8 +186,14 @@ async function withHostSlot<T>(host: string, fn: () => Promise<T>): Promise<T> {
     await new Promise((r) => setTimeout(r, 60));
   }
   hostActive.set(host, (hostActive.get(host) ?? 0) + 1);
-  const p = fn().finally(() => {
-    hostActive.set(host, Math.max(0, (hostActive.get(host) ?? 1) - 1));
+  const p = Promise.resolve().then(fn).finally(() => {
+    const remaining = Math.max(0, (hostActive.get(host) ?? 1) - 1);
+    if (remaining === 0) {
+      hostActive.delete(host);
+      hostQueues.delete(host);
+    } else {
+      hostActive.set(host, remaining);
+    }
   });
   hostQueues.set(host, p.catch(() => {}));
   return p;
@@ -337,7 +343,12 @@ export async function politeFetch(
   });
 }
 
-export const __testing = { isPrivateOrReservedIp, assertPublicHttpUrl, readBody };
+export const __testing = {
+  isPrivateOrReservedIp,
+  assertPublicHttpUrl,
+  readBody,
+  hostStateSize: () => ({ active: hostActive.size, queues: hostQueues.size }),
+};
 
 /** Run tasks with a global concurrency ceiling. */
 export async function pooled<T, R>(

@@ -117,3 +117,19 @@ test('the worker pool stops scheduling work after cancellation', async () => {
   );
   assert.deepEqual(started, [1]);
 });
+
+test('releases per-host bookkeeping after a request completes', async () => {
+  globalThis.fetch = (async () =>
+    new Response('<html>ok</html>', {
+      status: 200,
+      headers: { 'Content-Type': 'text/html' },
+    })) as typeof fetch;
+
+  try {
+    const result = await politeFetch('https://8.8.4.4/search');
+    assert.equal(result.ok, true);
+    assert.deepEqual(__testing.hostStateSize(), { active: 0, queues: 0 });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

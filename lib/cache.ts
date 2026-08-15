@@ -13,6 +13,7 @@ interface Entry<T> {
 }
 
 const store = new Map<string, Entry<unknown>>();
+const MAX_ENTRIES = 500;
 
 /** Evict expired keys occasionally so the map cannot grow without bound. */
 function sweep(): void {
@@ -33,7 +34,18 @@ export function cacheGet<T>(key: string): T | undefined {
 }
 
 export function cacheSet<T>(key: string, value: T, ttlMs: number): void {
-  if (store.size > 500) sweep();
+  if (store.size >= MAX_ENTRIES && !store.has(key)) {
+    sweep();
+    // A high-cardinality stream of fresh queries would otherwise grow forever:
+    // sweeping only expired entries does nothing when all 500 are still live.
+    while (store.size >= MAX_ENTRIES) {
+      const oldest = store.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      store.delete(oldest);
+    }
+  }
+  // Refresh insertion order so frequently updated keys outlive cold ones.
+  if (store.has(key)) store.delete(key);
   store.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
@@ -80,3 +92,12 @@ export const TTL = {
   /** Remember refusals so we stop hammering sites that block us. */
   blocked: 30 * 60 * 1000,
 } as const;
+
+export const __testing = {
+  size: () => store.size,
+  clear: () => {
+    store.clear();
+    inFlight.clear();
+  },
+  maxEntries: MAX_ENTRIES,
+};
