@@ -25,6 +25,15 @@ const MIRRORS = [
 /** Status codes that mean "busy, try again" rather than "wrong request". */
 const TRANSIENT = new Set([429, 502, 503, 504]);
 
+/**
+ * Nearby coordinates share an upstream lookup, but results are re-measured for
+ * the exact user before they leave this module. The buffer covers the furthest
+ * point inside a 0.001-degree cache cell (under 80 m anywhere on Earth).
+ */
+const CACHE_COORD_DECIMALS = 3;
+const CACHE_CELL_BUFFER_M = 100;
+const CACHE_VERSION = 2;
+
 /** OSM `shop=*` values that plausibly sell consumer tech. */
 const SHOP_TYPES = [
   'electronics',
@@ -224,8 +233,22 @@ export async function findStores(
   centre: Coords,
   radiusM: number
 ): Promise<StoreLookup> {
-  // Round the cache key so nearby searches share a result.
-  const key = `stores:${centre.lat.toFixed(3)}:${centre.lon.toFixed(3)}:${radiusM}`;
+  const cacheCentre = {
+    lat: Number(centre.lat.toFixed(CACHE_COORD_DECIMALS)),
+    lon: Number(centre.lon.toFixed(CACHE_COORD_DECIMALS)),
+  };
+  const key = `stores:v${CACHE_VERSION}:${cacheCentre.lat.toFixed(
+    CACHE_COORD_DECIMALS
+  )}:${cacheCentre.lon.toFixed(CACHE_COORD_DECIMALS)}:${radiusM}`;
+
+  const forExactCentre = (stores: Store[]): Store[] =>
+    stores
+      .map((store) => ({
+        ...store,
+        distanceM: Math.round(haversine(centre, store.coords)),
+      }))
+      .filter((store) => store.distanceM <= radiusM)
+      .sort((a, b) => a.distanceM - b.distanceM);
 
   try {
     // Only genuinely fresh results enter the in-memory cache. The stale
@@ -236,14 +259,15 @@ export async function findStores(
       const fresh = await diskGet<Store[]>(key, TTL.stores);
       if (fresh) return fresh.value;
 
-      const elements = await runOverpass(buildQuery(centre, radiusM));
+      const lookupRadiusM = radiusM + CACHE_CELL_BUFFER_M;
+      const elements = await runOverpass(buildQuery(cacheCentre, lookupRadiusM));
 
       const found = dedupeStores(
         elements
-          .map((el) => toStore(el, centre))
+          .map((el) => toStore(el, cacheCentre))
           .filter((s): s is Store => s !== null)
           // Overpass `around` is generous at the edges; enforce it ourselves.
-          .filter((s) => s.distanceM <= radiusM)
+          .filter((s) => s.distanceM <= lookupRadiusM)
           .sort((a, b) => a.distanceM - b.distanceM)
       );
 
@@ -259,10 +283,12 @@ export async function findStores(
     // the next request try again rather than holding it for a day.
     if (stores.length === 0) cacheDelete(key);
 
-    return { stores, staleAgeMs: null };
+    return { stores: forExactCentre(stores), staleAgeMs: null };
   } catch (err) {
     const stale = await diskGetStale<Store[]>(key);
-    if (stale) return { stores: stale.value, staleAgeMs: stale.ageMs };
+    if (stale) {
+      return { stores: forExactCentre(stale.value), staleAgeMs: stale.ageMs };
+    }
     throw err;
   }
 }

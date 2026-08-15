@@ -14,14 +14,18 @@ import type { Store } from '../lib/types';
 
 const realFetch = globalThis.fetch;
 
-function fakeStore(name: string, domain: string | null): Store {
+function fakeStore(
+  name: string,
+  domain: string | null,
+  coords = { lat: 43.24, lon: 76.88 }
+): Store {
   return {
     id: `node/${name}`,
     name,
     domain,
     website: domain ? `https://${domain}` : null,
     shopType: 'electronics',
-    coords: { lat: 43.24, lon: 76.88 },
+    coords,
     distanceM: 400,
     address: null,
     phone: null,
@@ -31,7 +35,7 @@ function fakeStore(name: string, domain: string | null): Store {
 
 /** Same key shape findStores uses internally. */
 function storeKey(lat: number, lon: number, radiusM: number): string {
-  return `stores:${lat.toFixed(3)}:${lon.toFixed(3)}:${radiusM}`;
+  return `stores:v2:${lat.toFixed(3)}:${lon.toFixed(3)}:${radiusM}`;
 }
 
 test('serves a stale store list when every Overpass mirror is down', async () => {
@@ -43,7 +47,11 @@ test('serves a stale store list when every Overpass mirror is down', async () =>
 
   // Seed the disk cache with an entry older than the fresh window.
   const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
-  await diskSet(key, [fakeStore('Old Shop', 'example.kz')], threeDaysAgo);
+  await diskSet(
+    key,
+    [fakeStore('Old Shop', 'example.kz', { lat: lat + 0.001, lon })],
+    threeDaysAgo
+  );
 
   globalThis.fetch = (async () => {
     throw new Error('network down');
@@ -164,6 +172,49 @@ test('disk cache round-trips and respects max age', async () => {
     const expired = await diskGet(key, -1);
     assert.equal(expired, null);
   } finally {
+    await rm(__testing.pathFor(key), { force: true }).catch(() => {});
+  }
+});
+
+test('recalculates cached shop distances for the exact user location', async () => {
+  const first = { lat: 14.1111, lon: 24.2221 };
+  // Same three-decimal cache cell, roughly 33 m north.
+  const second = { lat: 14.1114, lon: 24.2221 };
+  const radius = 900;
+  const key = storeKey(first.lat, first.lon, radius);
+  let calls = 0;
+
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response(
+      JSON.stringify({
+        version: 0.6,
+        elements: [
+          {
+            type: 'node',
+            id: 9001,
+            lat: first.lat,
+            lon: first.lon,
+            tags: { name: 'Exact Shop', shop: 'electronics', website: 'example.kz' },
+          },
+        ],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as unknown as typeof fetch;
+
+  try {
+    const atFirst = await findStores(first, radius);
+    const atSecond = await findStores(second, radius);
+
+    assert.equal(atFirst.stores[0].distanceM, 0);
+    assert.ok(
+      atSecond.stores[0].distanceM >= 30,
+      `expected a recalculated distance, got ${atSecond.stores[0].distanceM}`
+    );
+    assert.equal(calls, 1, 'nearby searches should still share the upstream lookup');
+  } finally {
+    globalThis.fetch = realFetch;
     await rm(__testing.pathFor(key), { force: true }).catch(() => {});
   }
 });

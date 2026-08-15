@@ -7,6 +7,7 @@ import {
 } from '@/lib/overpass';
 import { parseQuery } from '@/lib/product';
 import { rankDeals } from '@/lib/rank';
+import { selectDomains, validateSearchRequest } from '@/lib/searchRequest';
 import { IGNORED_DOMAINS, scrapeDomain } from '@/lib/scrape';
 import { adapterFor, labelFor } from '@/lib/scrape/adapters';
 import type {
@@ -14,7 +15,6 @@ import type {
   CoverageGap,
   DomainResult,
   ScrapeFailure,
-  SearchRequest,
 } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -26,22 +26,8 @@ export const dynamic = 'force-dynamic';
  */
 export const maxDuration = 60;
 
-/** Bounds keep the Overpass query cheap and the scrape polite. */
-const MIN_RADIUS_M = 300;
-const MAX_RADIUS_M = 25_000;
 /** How many retailer sites we hit at once, across all hosts. */
 const SCRAPE_CONCURRENCY = 6;
-/** Never scrape more than this many domains in one search. */
-const MAX_DOMAINS = 16;
-
-/**
- * Shops with no adapter need endpoint discovery, which is the slowest thing we
- * do — several candidate URLs against a host that may not answer at all. Known
- * retailers are unaffected; this only bounds the unknown tail so a search fits
- * inside a serverless request limit. Whatever is dropped is reported, never
- * silently skipped.
- */
-const MAX_UNKNOWN_DOMAINS = 6;
 
 /**
  * Reasons a retailer produced nothing, phrased for a shopper rather than a
@@ -81,26 +67,6 @@ function badRequest(message: string): Response {
   return Response.json({ error: message }, { status: 400 });
 }
 
-function validate(body: unknown): SearchRequest | string {
-  if (!body || typeof body !== 'object') return 'Body must be a JSON object';
-  const b = body as Record<string, unknown>;
-
-  const lat = Number(b.lat);
-  const lon = Number(b.lon);
-  const radiusM = Number(b.radiusM);
-  const item = typeof b.item === 'string' ? b.item.trim() : '';
-
-  if (!Number.isFinite(lat) || lat < -90 || lat > 90) return 'Invalid latitude';
-  if (!Number.isFinite(lon) || lon < -180 || lon > 180) return 'Invalid longitude';
-  if (!Number.isFinite(radiusM) || radiusM < MIN_RADIUS_M || radiusM > MAX_RADIUS_M) {
-    return `Radius must be between ${MIN_RADIUS_M} and ${MAX_RADIUS_M} metres`;
-  }
-  if (item.length < 2) return 'Item is required';
-  if (item.length > 120) return 'Item description is too long';
-
-  return { lat, lon, radiusM, item };
-}
-
 export async function POST(request: Request): Promise<Response> {
   let body: unknown;
   try {
@@ -109,7 +75,7 @@ export async function POST(request: Request): Promise<Response> {
     return badRequest('Malformed JSON');
   }
 
-  const validated = validate(body);
+  const validated = validateSearchRequest(body);
   if (typeof validated === 'string') return badRequest(validated);
 
   const { lat, lon, radiusM, item } = validated;
@@ -178,16 +144,9 @@ export async function POST(request: Request): Promise<Response> {
           })
           .map(([domain]) => domain);
 
-        // Keep every retailer we already know how to handle, plus the nearest
-        // handful of unknown ones. The rest are reported as skipped.
-        const known = ranked.filter((d) => adapterFor(d));
-        const unknown = ranked.filter((d) => !adapterFor(d));
-        const skipped = unknown.slice(MAX_UNKNOWN_DOMAINS);
-
-        const domains = [...known, ...unknown.slice(0, MAX_UNKNOWN_DOMAINS)].slice(
-          0,
-          MAX_DOMAINS
-        );
+        // Keep known retailers plus a bounded unknown tail. Every domain left
+        // out by either cap is retained as an explicit coverage gap.
+        const { domains, skipped } = selectDomains(ranked);
 
         send({ type: 'stores', count: stores.length, domains: domains.length });
 
