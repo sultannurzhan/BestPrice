@@ -28,8 +28,13 @@ export function validateSearchRequest(body: unknown): SearchRequest | string {
   }
   if (item.length < 2) return 'Item is required';
   if (item.length > 120) return 'Item description is too long';
+  if (!/[\p{L}\p{N}]/u.test(item)) return 'Item must include letters or numbers';
 
-  return { lat, lon, radiusM, item };
+  // The cache key need not distinguish radii a metre apart. Quantising here
+  // prevents arbitrary fractional radii from creating unbounded persistent
+  // cache cardinality while changing the requested edge by at most 50 m.
+  const normalisedRadiusM = Math.round(radiusM / 100) * 100;
+  return { lat, lon, radiusM: normalisedRadiusM, item };
 }
 
 /**

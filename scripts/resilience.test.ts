@@ -5,11 +5,18 @@
  */
 
 import assert from 'node:assert/strict';
-import { rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { diskGet, diskSet, __testing } from '../lib/diskCache';
-import { findStores, OverpassUnavailableError } from '../lib/overpass';
+import {
+  findStores,
+  groupByDomain,
+  OverpassUnavailableError,
+  __testing as overpassTesting,
+} from '../lib/overpass';
 import type { Store } from '../lib/types';
 
 const realFetch = globalThis.fetch;
@@ -126,6 +133,32 @@ test('treats an Overpass "remark" timeout as failure, not as zero shops', async 
   }
 });
 
+test('fails over when Overpass omits or corrupts its elements array', async () => {
+  for (const payload of [{ version: 0.6 }, { version: 0.6, elements: null }]) {
+    const lat = payload.elements === null ? 14.444 : 14.333;
+    const lon = payload.elements === null ? 24.444 : 24.333;
+    const radius = 2111;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      await assert.rejects(
+        () => findStores({ lat, lon }, radius),
+        (err: unknown) => err instanceof OverpassUnavailableError
+      );
+      assert.ok(calls > 1, `should fail over after malformed payload; calls=${calls}`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+});
+
 test('an empty store result is not cached', async () => {
   // A genuinely empty area must not be remembered as empty, or a transient
   // upstream failure sticks for the rest of the day.
@@ -217,4 +250,55 @@ test('recalculates cached shop distances for the exact user location', async () 
     globalThis.fetch = realFetch;
     await rm(__testing.pathFor(key), { force: true }).catch(() => {});
   }
+});
+
+test('prunes persistent cache files to a fixed entry budget', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bestprice-prune-'));
+  try {
+    const count = __testing.maxDiskEntries + 25;
+    await Promise.all(
+      Array.from({ length: count }, (_, i) =>
+        writeFile(join(dir, `${i.toString(16).padStart(20, '0')}.json`), '{}')
+      )
+    );
+
+    await __testing.pruneDir(dir);
+    const remaining = (await readdir(dir)).filter((name) => /^[a-f0-9]{20}\.json$/.test(name));
+    assert.equal(remaining.length, __testing.maxDiskEntries);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects malformed persisted store data before distance calculations', () => {
+  assert.equal(overpassTesting.normaliseCachedStores({ stores: [] }), null);
+  assert.equal(
+    overpassTesting.normaliseCachedStores([
+      { ...fakeStore('Broken', 'example.kz'), coords: { lat: 'north', lon: 76.9 } },
+    ]),
+    null
+  );
+  assert.deepEqual(
+    overpassTesting.normaliseCachedStores([fakeStore('Valid', 'example.kz')])?.map(
+      (store) => store.name
+    ),
+    ['Valid']
+  );
+});
+
+test('filters malformed Overpass elements before conversion', () => {
+  assert.equal(overpassTesting.isOverpassElement(null), false);
+  assert.equal(overpassTesting.isOverpassElement({ type: 'node', id: '1' }), false);
+  assert.equal(overpassTesting.isOverpassElement({ type: 'area', id: 1 }), false);
+  assert.equal(overpassTesting.isOverpassElement({ type: 'node', id: 1 }), true);
+});
+
+test('bounds per-retailer branch data before streaming deals', () => {
+  const stores = Array.from({ length: 75 }, (_, index) => ({
+    ...fakeStore(`Branch ${index}`, 'chain.example'),
+    distanceM: 75 - index,
+  }));
+  const branches = groupByDomain(stores).get('chain.example');
+  assert.equal(branches?.length, 50);
+  assert.equal(branches?.[0].distanceM, 1);
 });

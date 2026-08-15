@@ -42,3 +42,23 @@ test('reports every retailer omitted by the search time budget', () => {
   assert.equal(skipped.length, ranked.length - domains.length);
   assert.deepEqual(new Set([...domains, ...skipped]), new Set(ranked));
 });
+
+test('quantises arbitrary radii to keep persistent cache keys bounded', () => {
+  const validated = validateSearchRequest({
+    lat: 43.2,
+    lon: 76.9,
+    radiusM: 5_049.75,
+    item: 'iPhone',
+  });
+  assert.notEqual(typeof validated, 'string');
+  if (typeof validated !== 'string') assert.equal(validated.radiusM, 5_000);
+});
+
+test('rejects item descriptions with no searchable characters', () => {
+  for (const item of ['🔥🔥', '--', '   💸   ']) {
+    assert.equal(
+      validateSearchRequest({ lat: 43.2, lon: 76.9, radiusM: 5_000, item }),
+      'Item must include letters or numbers'
+    );
+  }
+});

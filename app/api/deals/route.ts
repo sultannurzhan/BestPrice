@@ -8,6 +8,13 @@ import {
 import { parseQuery } from '@/lib/product';
 import { rankDeals } from '@/lib/rank';
 import { selectDomains, validateSearchRequest } from '@/lib/searchRequest';
+import {
+  acquireSearchSlot,
+  assertSameOrigin,
+  checkSearchRateLimit,
+  readJsonBody,
+  RequestProblem,
+} from '@/lib/searchGuard';
 import { IGNORED_DOMAINS, scrapeDomain } from '@/lib/scrape';
 import { adapterFor, labelFor } from '@/lib/scrape/adapters';
 import type {
@@ -28,6 +35,9 @@ export const maxDuration = 60;
 
 /** How many retailer sites we hit at once, across all hosts. */
 const SCRAPE_CONCURRENCY = 6;
+/** Leave enough headroom to emit a useful error before the platform's 60s kill. */
+const SEARCH_BUDGET_MS = 52_000;
+const MAX_COVERAGE_GAPS = 50;
 
 /**
  * Reasons a retailer produced nothing, phrased for a shopper rather than a
@@ -66,24 +76,79 @@ function toGaps(results: DomainResult[]): CoverageGap[] {
   return gaps;
 }
 
-function badRequest(message: string): Response {
-  return Response.json({ error: message }, { status: 400 });
+function skippedGaps(domains: string[]): CoverageGap[] {
+  const visible = domains.slice(0, MAX_COVERAGE_GAPS).map((domain) => ({
+    label: labelFor(domain),
+    reason: 'skipped to keep the search within its time budget',
+  }));
+  if (domains.length > visible.length) {
+    visible.push({
+      label: `${domains.length - visible.length} more mapped retailers`,
+      reason: 'not listed individually to keep this response compact',
+    });
+  }
+  return visible;
+}
+
+function withRequestId(requestId: string, headers?: HeadersInit): Headers {
+  const result = new Headers(headers);
+  result.set('X-Request-ID', requestId);
+  return result;
+}
+
+function problem(
+  message: string,
+  status: number,
+  requestId: string,
+  headers?: HeadersInit
+): Response {
+  return Response.json(
+    { error: message },
+    { status, headers: withRequestId(requestId, headers) }
+  );
 }
 
 export async function POST(request: Request): Promise<Response> {
+  const requestId = crypto.randomUUID();
   let body: unknown;
   try {
-    body = await request.json();
-  } catch {
-    return badRequest('Malformed JSON');
+    assertSameOrigin(request);
+    body = await readJsonBody(request);
+  } catch (err) {
+    if (err instanceof RequestProblem) return problem(err.message, err.status, requestId);
+    return problem('Malformed JSON', 400, requestId);
   }
 
   const validated = validateSearchRequest(body);
-  if (typeof validated === 'string') return badRequest(validated);
+  if (typeof validated === 'string') return problem(validated, 400, requestId);
+
+  // Only a well-formed same-origin search consumes quota. Invalid or hostile
+  // requests cannot exhaust the allowance of a shared proxy address.
+  const rate = checkSearchRateLimit(request);
+  if (!rate.allowed) {
+    return problem('Too many searches. Please wait a moment and try again.', 429, requestId, {
+      'Retry-After': String(rate.retryAfterSeconds),
+      'RateLimit-Limit': String(rate.limit),
+      'RateLimit-Remaining': '0',
+    });
+  }
 
   const { lat, lon, radiusM, item } = validated;
+  const releaseSlot = acquireSearchSlot();
+  if (!releaseSlot) {
+    return problem('All search workers are busy. Please try again shortly.', 503, requestId, {
+      'Retry-After': '5',
+    });
+  }
   const encoder = new TextEncoder();
   const started = Date.now();
+  const consumerController = new AbortController();
+  const deadlineSignal = AbortSignal.timeout(SEARCH_BUDGET_MS);
+  const workSignal = AbortSignal.any([
+    request.signal,
+    consumerController.signal,
+    deadlineSignal,
+  ]);
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -95,6 +160,9 @@ export async function POST(request: Request): Promise<Response> {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
         } catch {
           closed = true;
+          consumerController.abort(
+            new DOMException('Response stream is no longer writable', 'AbortError')
+          );
         }
       };
 
@@ -106,8 +174,8 @@ export async function POST(request: Request): Promise<Response> {
       try {
         // ---- 1. Understand the request ---------------------------------
         send({ type: 'status', message: 'Understanding what you are looking for…' });
-        const query = await enrichQuery(parseQuery(item), request.signal);
-        request.signal.throwIfAborted();
+        const query = await enrichQuery(parseQuery(item), workSignal);
+        workSignal.throwIfAborted();
         send({ type: 'query', query });
 
         // ---- 2. Find shops around the user ------------------------------
@@ -116,8 +184,12 @@ export async function POST(request: Request): Promise<Response> {
           message: `Finding tech shops within ${(radiusM / 1000).toFixed(1)} km…`,
         });
 
-        const { stores, staleAgeMs } = await findStores({ lat, lon }, radiusM);
-        request.signal.throwIfAborted();
+        const { stores, staleAgeMs } = await findStores(
+          { lat, lon },
+          radiusM,
+          workSignal
+        );
+        workSignal.throwIfAborted();
         if (staleAgeMs !== null) {
           send({
             type: 'status',
@@ -186,24 +258,36 @@ export async function POST(request: Request): Promise<Response> {
           }…`,
         });
 
-        const results: DomainResult[] = await pooled(
-          domains,
-          SCRAPE_CONCURRENCY,
-          async (domain) => {
-            send({ type: 'domain', domain, state: 'start' });
-            const result = await scrapeDomain(domain, query);
-            send({
-              type: 'domain',
-              domain,
-              state: 'done',
-              found: result.listings.length,
-              failure: result.failure,
-              tookMs: result.tookMs,
-            });
-            return result;
-          },
-          { signal: request.signal }
-        );
+        const completed: DomainResult[] = [];
+        let results: DomainResult[];
+        try {
+          results = await pooled(
+            domains,
+            SCRAPE_CONCURRENCY,
+            async (domain) => {
+              send({ type: 'domain', domain, state: 'start' });
+              const result = await scrapeDomain(domain, query, workSignal);
+              completed.push(result);
+              send({
+                type: 'domain',
+                domain,
+                state: 'done',
+                found: result.listings.length,
+                failure: result.failure,
+                tookMs: result.tookMs,
+              });
+              return result;
+            },
+            { signal: workSignal }
+          );
+        } catch (err) {
+          if (!deadlineSignal.aborted || completed.length === 0) throw err;
+          results = completed;
+          send({
+            type: 'status',
+            message: 'Time limit reached — ranking the retailers that completed…',
+          });
+        }
 
         // ---- 4. Match, cost and rank -------------------------------------
         send({ type: 'status', message: 'Filtering accessories and ranking by true cost…' });
@@ -214,8 +298,26 @@ export async function POST(request: Request): Promise<Response> {
           query,
         });
 
-        const verdict = await writeVerdict(deals, query, request.signal);
-        request.signal.throwIfAborted();
+        const verdict = await writeVerdict(deals, query, workSignal);
+        if (!deadlineSignal.aborted) workSignal.throwIfAborted();
+
+        const completedDomains = new Set(results.map((result) => result.domain));
+        const timedOutDomains = deadlineSignal.aborted
+          ? domains.filter((domain) => !completedDomains.has(domain))
+          : [];
+
+        // A started retailer must always receive a terminal event so progress
+        // chips never remain stuck on an ellipsis after the global deadline.
+        for (const domain of timedOutDomains) {
+          send({
+            type: 'domain',
+            domain,
+            state: 'done',
+            found: 0,
+            failure: 'timeout',
+            tookMs: Date.now() - started,
+          });
+        }
 
         send({
           type: 'results',
@@ -229,26 +331,38 @@ export async function POST(request: Request): Promise<Response> {
             dealsFound: deals.length,
             gaps: [
               ...toGaps(results),
-              ...skipped.map((domain) => ({
+              ...timedOutDomains.map((domain) => ({
                 label: labelFor(domain),
-                reason: 'skipped to keep the search within its time budget',
+                reason: 'did not finish before the search time limit',
               })),
+              ...skippedGaps(skipped),
             ],
             verdict,
             tookMs: Date.now() - started,
           },
         });
       } catch (err) {
+        if (request.signal.aborted || consumerController.signal.aborted) return;
+        const unexpected =
+          !deadlineSignal.aborted && !(err instanceof OverpassUnavailableError);
+        if (unexpected) {
+          console.error('BestPrice search failed', {
+            requestId,
+            name: err instanceof Error ? err.name : 'UnknownError',
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
         send({
           type: 'error',
           message:
-            err instanceof OverpassUnavailableError
+            deadlineSignal.aborted
+              ? 'The search reached its time limit. Try again — cached shop data will make the next attempt faster.'
+              : err instanceof OverpassUnavailableError
               ? 'OpenStreetMap’s public servers are overloaded right now and no cached store list exists for this area. Try again in a minute.'
-              : err instanceof Error
-                ? err.message
-                : 'Unexpected failure',
+              : `The search failed unexpectedly. Please try again (reference ${requestId}).`,
         });
       } finally {
+        releaseSlot();
         if (!closed) {
           try {
             controller.close();
@@ -258,15 +372,22 @@ export async function POST(request: Request): Promise<Response> {
         }
       }
     },
+    cancel() {
+      consumerController.abort(
+        new DOMException('Response consumer cancelled', 'AbortError')
+      );
+    },
   });
 
   return new Response(stream, {
-    headers: {
+    headers: withRequestId(requestId, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       // Disable proxy buffering so events arrive as they happen.
       'X-Accel-Buffering': 'no',
-    },
+      'RateLimit-Limit': String(rate.limit),
+      'RateLimit-Remaining': String(rate.remaining),
+    }),
   });
 }

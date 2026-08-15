@@ -1,5 +1,14 @@
 import { lookup } from 'node:dns/promises';
+import { request as httpRequest, type RequestOptions } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { BlockList, isIP } from 'node:net';
+import { Readable } from 'node:stream';
+import { checkServerIdentity } from 'node:tls';
+import {
+  createBrotliDecompress,
+  createGunzip,
+  createInflate,
+} from 'node:zlib';
 
 import type { ScrapeFailure } from './types';
 
@@ -26,11 +35,13 @@ const BASE_HEADERS: Record<string, string> = {
   'Sec-Fetch-Mode': 'navigate',
   'Sec-Fetch-Site': 'none',
   'Upgrade-Insecure-Requests': '1',
+  'Accept-Encoding': 'gzip, deflate, br',
 };
 
 /** fmobile.kz is about 3.8 MB; anything beyond this is not a search page budget. */
 export const MAX_RESPONSE_BYTES = 6 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
+const GLOBAL_OUTBOUND_LIMIT = 16;
 
 const blockedIps = new BlockList();
 for (const [network, prefix] of [
@@ -53,7 +64,10 @@ for (const [network, prefix] of [
   blockedIps.addSubnet(network, prefix, 'ipv4');
 }
 for (const [network, prefix] of [
-  ['::', 128],
+  // Deprecated IPv4-compatible forms (`::192.168.1.1`) occupy ::/96. They
+  // should never be used as public retailer endpoints and can otherwise bypass
+  // the IPv4 block list through an IPv6 parser.
+  ['::', 96],
   ['::1', 128],
   ['64:ff9b::', 96],
   ['64:ff9b:1::', 48],
@@ -83,22 +97,35 @@ class UnsafeUrlError extends Error {}
 
 const DNS_TIMEOUT_MS = 3_000;
 
-async function lookupAll(hostname: string): Promise<Array<{ address: string; family: number }>> {
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('DNS lookup timed out')), DNS_TIMEOUT_MS);
+function abortPromise(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
   });
-  try {
-    return await Promise.race([
-      lookup(hostname, { all: true, verbatim: true }),
-      timeout,
-    ]);
-  } finally {
-    clearTimeout(timer!);
-  }
 }
 
-async function assertPublicHttpUrl(raw: string): Promise<URL> {
+async function lookupAll(
+  hostname: string,
+  signal?: AbortSignal
+): Promise<Array<{ address: string; family: number }>> {
+  const timeout = AbortSignal.timeout(DNS_TIMEOUT_MS);
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  return Promise.race([
+    lookup(hostname, { all: true, verbatim: true }),
+    abortPromise(combined),
+  ]);
+}
+
+interface ResolvedHttpUrl {
+  url: URL;
+  addresses: Array<{ address: string; family: number }>;
+}
+
+async function assertPublicHttpUrl(
+  raw: string,
+  signal?: AbortSignal
+): Promise<ResolvedHttpUrl> {
+  signal?.throwIfAborted();
   let url: URL;
   try {
     url = new URL(raw);
@@ -113,6 +140,12 @@ async function assertPublicHttpUrl(raw: string): Promise<URL> {
     url.href.length > 4_096
   ) {
     throw new UnsafeUrlError('Only public HTTP URLs are allowed');
+  }
+  // Retailer search pages should use the protocol's standard port. Blocking
+  // arbitrary public ports narrows SSRF-like probing and avoids treating an
+  // unrelated service on the same host as a shop website.
+  if (url.port) {
+    throw new UnsafeUrlError('Non-standard HTTP ports are not allowed');
   }
 
   const hostname = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
@@ -131,13 +164,17 @@ async function assertPublicHttpUrl(raw: string): Promise<URL> {
     if (isPrivateOrReservedIp(hostname)) {
       throw new UnsafeUrlError('Private or reserved addresses are not allowed');
     }
-    return url;
+    return {
+      url,
+      addresses: [{ address: hostname, family: literalFamily }],
+    };
   }
 
   let addresses: Array<{ address: string; family: number }>;
   try {
-    addresses = await lookupAll(hostname);
+    addresses = await lookupAll(hostname, signal);
   } catch {
+    signal?.throwIfAborted();
     // DNS failure is an ordinary unreachable retailer, not a security finding.
     throw new Error('DNS lookup failed');
   }
@@ -146,8 +183,88 @@ async function assertPublicHttpUrl(raw: string): Promise<URL> {
     throw new UnsafeUrlError('Hostname resolves to a private or reserved address');
   }
 
-  return url;
+  return { url, addresses };
 }
+
+type Transport = (target: ResolvedHttpUrl, signal: AbortSignal) => Promise<Response>;
+
+function responseBody(res: import('node:http').IncomingMessage): Readable {
+  const encoding = String(res.headers['content-encoding'] ?? '').toLowerCase();
+  if (/\bbr\b/.test(encoding)) return res.pipe(createBrotliDecompress());
+  if (/\bgzip\b/.test(encoding)) return res.pipe(createGunzip());
+  if (/\bdeflate\b/.test(encoding)) return res.pipe(createInflate());
+  return res;
+}
+
+function requestAddress(
+  target: ResolvedHttpUrl,
+  address: { address: string; family: number },
+  signal: AbortSignal
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const { url } = target;
+    const isHttps = url.protocol === 'https:';
+    const options: RequestOptions = {
+      protocol: url.protocol,
+      hostname: address.address,
+      family: address.family,
+      port: url.port || undefined,
+      path: `${url.pathname}${url.search}`,
+      method: 'GET',
+      headers: { ...BASE_HEADERS, Host: url.host },
+      signal,
+      agent: false,
+    };
+    if (isHttps) {
+      Object.assign(options, {
+        servername: url.hostname,
+        checkServerIdentity: (_hostname: string, cert: Parameters<typeof checkServerIdentity>[1]) =>
+          checkServerIdentity(url.hostname, cert),
+      });
+    }
+
+    const request = (isHttps ? httpsRequest : httpRequest)(options, (res) => {
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(res.headers)) {
+        if (Array.isArray(value)) {
+          for (const item of value) headers.append(name, item);
+        } else if (value !== undefined) {
+          headers.set(name, String(value));
+        }
+      }
+
+      const status = res.statusCode ?? 500;
+      const noBody = [204, 205, 304].includes(status);
+      const decoded = noBody ? null : responseBody(res);
+      const body = decoded
+        ? (Readable.toWeb(decoded) as ReadableStream<Uint8Array>)
+        : null;
+      resolve(new Response(body, { status, headers }));
+    });
+    request.once('error', reject);
+    request.end();
+  });
+}
+
+/** Connect to an address we already validated, preserving the original Host/SNI. */
+async function pinnedTransport(
+  target: ResolvedHttpUrl,
+  signal: AbortSignal
+): Promise<Response> {
+  let lastError: unknown = new Error('No resolved addresses');
+  for (const address of target.addresses) {
+    signal.throwIfAborted();
+    try {
+      return await requestAddress(target, address, signal);
+    } catch (err) {
+      signal.throwIfAborted();
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
+let transportOverride: Transport | null = null;
 
 async function readBody(res: Response): Promise<string | null> {
   const declared = Number(res.headers.get('content-length'));
@@ -177,14 +294,96 @@ async function readBody(res: Response): Promise<string | null> {
 const PER_HOST_LIMIT = 2;
 const hostQueues = new Map<string, Promise<unknown>>();
 const hostActive = new Map<string, number>();
+let globalActive = 0;
 
-async function withHostSlot<T>(host: string, fn: () => Promise<T>): Promise<T> {
+interface GlobalWaiter {
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  resolve: (release: () => void) => void;
+  reject: (reason: unknown) => void;
+}
+
+const globalWaiters: GlobalWaiter[] = [];
+
+function globalRelease(): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    globalActive = Math.max(0, globalActive - 1);
+
+    for (;;) {
+      const waiter = globalWaiters.shift();
+      if (!waiter) return;
+      if (waiter.signal?.aborted) continue;
+      if (waiter.signal && waiter.onAbort) {
+        waiter.signal.removeEventListener('abort', waiter.onAbort);
+      }
+      globalActive++;
+      waiter.resolve(globalRelease());
+      return;
+    }
+  };
+}
+
+function acquireGlobalSlot(signal?: AbortSignal): Promise<() => void> {
+  signal?.throwIfAborted();
+  if (globalActive < GLOBAL_OUTBOUND_LIMIT) {
+    globalActive++;
+    return Promise.resolve(globalRelease());
+  }
+
+  return new Promise((resolve, reject) => {
+    const waiter: GlobalWaiter = { signal, resolve, reject };
+    const onAbort = () => {
+      const index = globalWaiters.indexOf(waiter);
+      if (index >= 0) globalWaiters.splice(index, 1);
+      reject(signal?.reason);
+    };
+    waiter.onAbort = onAbort;
+    signal?.addEventListener('abort', onAbort, { once: true });
+    globalWaiters.push(waiter);
+  });
+}
+
+async function withGlobalSlot<T>(
+  fn: () => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  const release = await acquireGlobalSlot(signal);
+  try {
+    signal?.throwIfAborted();
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+async function waitForSlot(promise: Promise<unknown>, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    await promise.catch(() => {});
+    return;
+  }
+  await Promise.race([promise.catch(() => {}), abortPromise(signal)]);
+}
+
+async function withHostSlot<T>(
+  host: string,
+  fn: () => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  signal?.throwIfAborted();
   while ((hostActive.get(host) ?? 0) >= PER_HOST_LIMIT) {
-    await hostQueues.get(host)?.catch(() => {});
+    const queued = hostQueues.get(host);
+    if (queued) await waitForSlot(queued, signal);
     // Re-check in case several callers woke together.
     if ((hostActive.get(host) ?? 0) < PER_HOST_LIMIT) break;
-    await new Promise((r) => setTimeout(r, 60));
+    await Promise.race([
+      new Promise((resolve) => setTimeout(resolve, 60)),
+      ...(signal ? [abortPromise(signal)] : []),
+    ]);
   }
+  signal?.throwIfAborted();
   hostActive.set(host, (hostActive.get(host) ?? 0) + 1);
   const p = Promise.resolve().then(fn).finally(() => {
     const remaining = Math.max(0, (hostActive.get(host) ?? 1) - 1);
@@ -217,137 +416,170 @@ function looksBlocked(status: number, body: string): boolean {
 
 export async function politeFetch(
   url: string,
-  { timeoutMs = 12_000 }: { timeoutMs?: number } = {}
+  {
+    timeoutMs = 12_000,
+    signal,
+  }: { timeoutMs?: number; signal?: AbortSignal } = {}
 ): Promise<FetchResult> {
-  let initial: URL;
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const operationSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
   try {
-    initial = await assertPublicHttpUrl(url);
-  } catch (err) {
-    const failure = err instanceof UnsafeUrlError ? 'unsafe-url' : 'unreachable';
-    return { ok: false, status: 0, html: '', finalUrl: url, failure };
-  }
+    const initial = await assertPublicHttpUrl(url, operationSignal);
+    let current = initial;
 
-  return withHostSlot(initial.host, async () => {
-    try {
-      const signal = AbortSignal.timeout(timeoutMs);
-      let current = initial;
+    for (let redirectNo = 0; redirectNo <= MAX_REDIRECTS; redirectNo++) {
+      // Apply both limits to every redirect hop. Otherwise a redirect could
+      // bypass the destination host's politeness limit, and many distinct
+      // domains could collectively exhaust sockets and memory.
+      const hop = await withHostSlot(
+        current.url.host,
+        () =>
+          withGlobalSlot(async () => {
+            const res = await (transportOverride ?? pinnedTransport)(
+              current,
+              operationSignal
+            );
 
-      for (let redirectNo = 0; redirectNo <= MAX_REDIRECTS; redirectNo++) {
-        const res = await fetch(current, {
-          headers: BASE_HEADERS,
-          redirect: 'manual',
-          signal,
-        });
+            if ([301, 302, 303, 307, 308].includes(res.status)) {
+              const location = res.headers.get('location');
+              await res.body?.cancel().catch(() => {});
+              return { kind: 'redirect' as const, status: res.status, location };
+            }
 
-        if ([301, 302, 303, 307, 308].includes(res.status)) {
-          const location = res.headers.get('location');
-          await res.body?.cancel().catch(() => {});
-          if (!location || redirectNo === MAX_REDIRECTS) {
+            if ([403, 429, 503].includes(res.status)) {
+              await res.body?.cancel().catch(() => {});
+              return {
+                kind: 'complete' as const,
+                value: {
+                  ok: false,
+                  status: res.status,
+                  html: '',
+                  finalUrl: current.url.toString(),
+                  failure: 'blocked' as const,
+                },
+              };
+            }
+
+            const ct = res.headers.get('content-type') ?? '';
+            if (!/text\/html|application\/xhtml|application\/json/i.test(ct)) {
+              await res.body?.cancel().catch(() => {});
+              return {
+                kind: 'complete' as const,
+                value: {
+                  ok: false,
+                  status: res.status,
+                  html: '',
+                  finalUrl: current.url.toString(),
+                  failure: 'no-listings' as const,
+                },
+              };
+            }
+
+            const html = await readBody(res);
+            if (html === null) {
+              return {
+                kind: 'complete' as const,
+                value: {
+                  ok: false,
+                  status: res.status,
+                  html: '',
+                  finalUrl: current.url.toString(),
+                  failure: 'response-too-large' as const,
+                },
+              };
+            }
+
+            if (looksBlocked(res.status, html)) {
+              return {
+                kind: 'complete' as const,
+                value: {
+                  ok: false,
+                  status: res.status,
+                  html: '',
+                  finalUrl: current.url.toString(),
+                  failure: 'blocked' as const,
+                },
+              };
+            }
+            if (!res.ok) {
+              return {
+                kind: 'complete' as const,
+                value: {
+                  ok: false,
+                  status: res.status,
+                  html: '',
+                  finalUrl: current.url.toString(),
+                  failure: 'unreachable' as const,
+                },
+              };
+            }
+
             return {
-              ok: false,
-              status: res.status,
-              html: '',
-              finalUrl: current.toString(),
-              failure: 'unreachable' as const,
+              kind: 'complete' as const,
+              value: {
+                ok: true,
+                status: res.status,
+                html,
+                finalUrl: current.url.toString(),
+                failure: null,
+              },
             };
-          }
-          const redirected = new URL(location, current);
-          current = await assertPublicHttpUrl(redirected.toString());
-          continue;
-        }
+          }, operationSignal),
+        operationSignal
+      );
 
-        if ([403, 429, 503].includes(res.status)) {
-          await res.body?.cancel().catch(() => {});
-          return {
-            ok: false,
-            status: res.status,
-            html: '',
-            finalUrl: current.toString(),
-            failure: 'blocked' as const,
-          };
-        }
-
-        const ct = res.headers.get('content-type') ?? '';
-        if (!/text\/html|application\/xhtml|application\/json/i.test(ct)) {
-          await res.body?.cancel().catch(() => {});
-          return {
-            ok: false,
-            status: res.status,
-            html: '',
-            finalUrl: current.toString(),
-            failure: 'no-listings' as const,
-          };
-        }
-
-        const html = await readBody(res);
-        if (html === null) {
-          return {
-            ok: false,
-            status: res.status,
-            html: '',
-            finalUrl: current.toString(),
-            failure: 'response-too-large' as const,
-          };
-        }
-
-        if (looksBlocked(res.status, html)) {
-          return {
-            ok: false,
-            status: res.status,
-            html: '',
-            finalUrl: current.toString(),
-            failure: 'blocked' as const,
-          };
-        }
-        if (!res.ok) {
-          return {
-            ok: false,
-            status: res.status,
-            html: '',
-            finalUrl: current.toString(),
-            failure: 'unreachable' as const,
-          };
-        }
-
-        return {
-          ok: true,
-          status: res.status,
-          html,
-          finalUrl: current.toString(),
-          failure: null,
-        };
-      }
-
-      return { ok: false, status: 0, html: '', finalUrl: url, failure: 'unreachable' };
-    } catch (err) {
-      if (err instanceof UnsafeUrlError) {
+      if (hop.kind === 'complete') return hop.value;
+      if (!hop.location || redirectNo === MAX_REDIRECTS) {
         return {
           ok: false,
-          status: 0,
+          status: hop.status,
           html: '',
-          finalUrl: url,
-          failure: 'unsafe-url' as const,
+          finalUrl: current.url.toString(),
+          failure: 'unreachable' as const,
         };
       }
-      const timedOut =
-        err instanceof Error &&
-        (err.name === 'TimeoutError' || /timeout|aborted/i.test(err.message));
+      const redirected = new URL(hop.location, current.url);
+      current = await assertPublicHttpUrl(redirected.toString(), operationSignal);
+    }
+
+    return { ok: false, status: 0, html: '', finalUrl: url, failure: 'unreachable' };
+  } catch (err) {
+    signal?.throwIfAborted();
+    if (err instanceof UnsafeUrlError) {
       return {
         ok: false,
         status: 0,
         html: '',
         finalUrl: url,
-        failure: timedOut ? ('timeout' as const) : ('unreachable' as const),
+        failure: 'unsafe-url' as const,
       };
     }
-  });
+    const timedOut =
+      timeout.aborted ||
+      (err instanceof Error &&
+        (err.name === 'TimeoutError' || /timeout|aborted/i.test(err.message)));
+    return {
+      ok: false,
+      status: 0,
+      html: '',
+      finalUrl: url,
+      failure: timedOut ? ('timeout' as const) : ('unreachable' as const),
+    };
+  }
 }
 
 export const __testing = {
   isPrivateOrReservedIp,
   assertPublicHttpUrl,
+  pinnedTransport,
+  setTransport: (transport: Transport | null) => {
+    transportOverride = transport;
+  },
   readBody,
   hostStateSize: () => ({ active: hostActive.size, queues: hostQueues.size }),
+  globalState: () => ({ active: globalActive, queued: globalWaiters.length }),
+  globalLimit: GLOBAL_OUTBOUND_LIMIT,
 };
 
 /** Run tasks with a global concurrency ceiling. */

@@ -24,6 +24,10 @@ const MIRRORS = [
 
 /** Status codes that mean "busy, try again" rather than "wrong request". */
 const TRANSIENT = new Set([429, 502, 503, 504]);
+const MAX_OVERPASS_BYTES = 8 * 1024 * 1024;
+const MAX_OVERPASS_ELEMENTS = 5_000;
+const MAX_STORES = 2_000;
+const MAX_BRANCHES_PER_DOMAIN = 50;
 
 /**
  * Nearby coordinates share an upstream lookup, but results are re-measured for
@@ -54,6 +58,17 @@ interface OverpassElement {
   tags?: Record<string, string>;
 }
 
+function isOverpassElement(value: unknown): value is OverpassElement {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const element = value as Record<string, unknown>;
+  return (
+    ['node', 'way', 'relation'].includes(String(element.type)) &&
+    typeof element.id === 'number' &&
+    Number.isSafeInteger(element.id) &&
+    element.id > 0
+  );
+}
+
 function buildQuery(centre: Coords, radiusM: number): string {
   const clauses = SHOP_TYPES.map(
     (t) => `  nwr(around:${radiusM},${centre.lat},${centre.lon})["shop"="${t}"];`
@@ -62,7 +77,14 @@ function buildQuery(centre: Coords, radiusM: number): string {
   return `[out:json][timeout:25];\n(\n${clauses}\n);\nout center tags;`;
 }
 
-async function askMirror(url: string, query: string): Promise<OverpassElement[]> {
+async function askMirror(
+  url: string,
+  query: string,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<OverpassElement[]> {
+  signal?.throwIfAborted();
+  const timeout = AbortSignal.timeout(Math.max(1, timeoutMs));
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -75,7 +97,7 @@ async function askMirror(url: string, query: string): Promise<OverpassElement[]>
      * waiting 40 s only delays failing over to one that works — and on a
      * serverless host the whole request has a hard 60 s ceiling to fit inside.
      */
-    signal: AbortSignal.timeout(18_000),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });
 
   if (!res.ok) {
@@ -84,7 +106,33 @@ async function askMirror(url: string, query: string): Promise<OverpassElement[]>
     throw err;
   }
 
-  const json = (await res.json()) as {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_OVERPASS_BYTES) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error('response too large');
+  }
+  if (!res.body) throw new Error('empty response');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > MAX_OVERPASS_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new Error('response too large');
+    }
+    chunks.push(decoder.decode(value, { stream: true }));
+  }
+  chunks.push(decoder.decode());
+
+  const parsed = JSON.parse(chunks.join('')) as unknown;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('invalid Overpass response');
+  }
+  const json = parsed as {
     elements?: OverpassElement[];
     remark?: string;
   };
@@ -96,11 +144,15 @@ async function askMirror(url: string, query: string): Promise<OverpassElement[]>
    * the deployed app confidently reported zero stores in central Almaty.
    * Treat it as a failure so we fail over to another mirror.
    */
-  if (json.remark && /error|timed? ?out|memory/i.test(json.remark)) {
+  if (typeof json.remark === 'string' && /error|timed? ?out|memory/i.test(json.remark)) {
     throw new Error(`remark: ${json.remark.slice(0, 80)}`);
   }
 
-  return json.elements ?? [];
+  if (!Array.isArray(json.elements)) {
+    throw new Error('invalid Overpass response');
+  }
+
+  return json.elements.slice(0, MAX_OVERPASS_ELEMENTS).filter(isOverpassElement);
 }
 
 export class OverpassUnavailableError extends Error {
@@ -117,7 +169,26 @@ export class OverpassUnavailableError extends Error {
  * all of them failed simultaneously — hence both the long mirror list and the
  * stale-cache fallback in `findStores`.
  */
-async function runOverpass(query: string): Promise<OverpassElement[]> {
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function runOverpass(
+  query: string,
+  signal?: AbortSignal
+): Promise<OverpassElement[]> {
   const attempts: string[] = [];
   /**
    * Leave room for the actual price scraping. Serverless hosts cap the whole
@@ -127,6 +198,7 @@ async function runOverpass(query: string): Promise<OverpassElement[]> {
   const deadline = Date.now() + 32_000;
 
   for (const url of MIRRORS) {
+    signal?.throwIfAborted();
     if (Date.now() > deadline) {
       attempts.push('deadline reached');
       break;
@@ -135,16 +207,24 @@ async function runOverpass(query: string): Promise<OverpassElement[]> {
     const host = new URL(url).host;
 
     for (let tryNo = 0; tryNo < 2; tryNo++) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        attempts.push('deadline reached');
+        break;
+      }
       try {
-        return await askMirror(url, query);
+        return await askMirror(url, query, Math.min(18_000, remainingMs), signal);
       } catch (err) {
+        signal?.throwIfAborted();
         const status = (err as Error & { status?: number }).status;
         const message = err instanceof Error ? err.message : String(err);
         attempts.push(`${host}=${message}`);
 
         // Only a transient status is worth an immediate retry.
         if (tryNo === 0 && status !== undefined && TRANSIENT.has(status)) {
-          await new Promise((r) => setTimeout(r, 700));
+          const retryDelay = Math.min(700, Math.max(0, deadline - Date.now()));
+          if (retryDelay === 0) break;
+          await abortableDelay(retryDelay, signal);
           continue;
         }
         break;
@@ -155,11 +235,13 @@ async function runOverpass(query: string): Promise<OverpassElement[]> {
   throw new OverpassUnavailableError(attempts);
 }
 
-function normaliseDomain(raw: string | undefined): {
+function normaliseDomain(raw: unknown): {
   domain: string | null;
   website: string | null;
 } {
-  if (!raw) return { domain: null, website: null };
+  if (typeof raw !== 'string' || !raw || raw.length > 4_096) {
+    return { domain: null, website: null };
+  }
   const trimmed = raw.trim();
   if (!trimmed) return { domain: null, website: null };
 
@@ -178,44 +260,65 @@ function normaliseDomain(raw: string | undefined): {
 }
 
 function buildAddress(tags: Record<string, string>): string | null {
-  const street = tags['addr:street'];
-  const houseNumber = tags['addr:housenumber'];
-  const city = tags['addr:city'];
+  const safe = (value: unknown, max: number): string | undefined =>
+    typeof value === 'string' && value.trim()
+      ? value.trim().slice(0, max)
+      : undefined;
+  const street = safe(tags['addr:street'], 120);
+  const houseNumber = safe(tags['addr:housenumber'], 30);
+  const city = safe(tags['addr:city'], 100);
   const parts = [
     [street, houseNumber].filter(Boolean).join(' '),
     city,
   ].filter(Boolean);
-  return parts.length ? parts.join(', ') : null;
+  return parts.length ? parts.join(', ').slice(0, 240) : null;
 }
 
 function toStore(el: OverpassElement, centre: Coords): Store | null {
-  const tags = el.tags ?? {};
+  const tags =
+    el.tags && typeof el.tags === 'object' && !Array.isArray(el.tags)
+      ? el.tags
+      : {};
   const lat = el.lat ?? el.center?.lat;
   const lon = el.lon ?? el.center?.lon;
-  if (lat === undefined || lon === undefined) return null;
+  if (
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lon) ||
+    (lat as number) < -90 ||
+    (lat as number) > 90 ||
+    (lon as number) < -180 ||
+    (lon as number) > 180
+  ) {
+    return null;
+  }
 
-  const name =
+  const rawName =
     tags.name ?? tags['name:ru'] ?? tags['name:kk'] ?? tags.brand ?? tags.operator;
   // An unnamed pin we cannot attribute to a retailer is not actionable.
-  if (!name) return null;
+  if (typeof rawName !== 'string' || !rawName.trim()) return null;
+  const name = rawName.trim().slice(0, 160);
 
   const { domain, website } = normaliseDomain(
     tags.website ?? tags['contact:website'] ?? tags.url ?? tags['brand:website']
   );
 
-  const coords = { lat, lon };
+  const coords = { lat: lat as number, lon: lon as number };
+  const safeTag = (value: unknown, max: number): string | null =>
+    typeof value === 'string' && value.trim()
+      ? value.trim().slice(0, max)
+      : null;
 
   return {
     id: `${el.type}/${el.id}`,
-    name: name.trim(),
+    name,
     domain,
     website,
-    shopType: tags.shop ?? 'unknown',
+    shopType: safeTag(tags.shop, 60) ?? 'unknown',
     coords,
     distanceM: Math.round(haversine(centre, coords)),
     address: buildAddress(tags),
-    phone: tags.phone ?? tags['contact:phone'] ?? null,
-    openingHours: tags.opening_hours ?? null,
+    phone: safeTag(tags.phone ?? tags['contact:phone'], 80),
+    openingHours: safeTag(tags.opening_hours, 200),
   };
 }
 
@@ -225,17 +328,58 @@ export interface StoreLookup {
   staleAgeMs: number | null;
 }
 
+function isCachedStore(value: unknown): value is Store {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const store = value as Record<string, unknown>;
+  const coords = store.coords as Record<string, unknown> | null;
+  const boundedNullableString = (item: unknown, max: number) =>
+    item === null || (typeof item === 'string' && item.length <= max);
+  return (
+    typeof store.id === 'string' &&
+    store.id.length > 0 &&
+    store.id.length <= 200 &&
+    typeof store.name === 'string' &&
+    store.name.length > 0 &&
+    store.name.length <= 160 &&
+    boundedNullableString(store.domain, 253) &&
+    boundedNullableString(store.website, 2_048) &&
+    typeof store.shopType === 'string' &&
+    store.shopType.length <= 60 &&
+    coords !== null &&
+    typeof coords === 'object' &&
+    Number.isFinite(coords.lat) &&
+    Number(coords.lat) >= -90 &&
+    Number(coords.lat) <= 90 &&
+    Number.isFinite(coords.lon) &&
+    Number(coords.lon) >= -180 &&
+    Number(coords.lon) <= 180 &&
+    Number.isFinite(store.distanceM) &&
+    Number(store.distanceM) >= 0 &&
+    boundedNullableString(store.address, 240) &&
+    boundedNullableString(store.phone, 80) &&
+    boundedNullableString(store.openingHours, 200)
+  );
+}
+
+function normaliseCachedStores(value: unknown): Store[] | null {
+  if (!Array.isArray(value)) return null;
+  const stores = value.slice(0, MAX_STORES).filter(isCachedStore);
+  return stores.length > 0 ? stores : null;
+}
+
 /**
  * Find tech shops within `radiusM` of `centre`, nearest first.
  *
  * Shop locations do not move, so results are cached in memory for a day and on
- * disk indefinitely. If every Overpass mirror is down — which happens — we fall
- * back to the disk copy at any age rather than failing the whole search.
+ * bounded disk storage. If every Overpass mirror is down — which happens — we
+ * fall back to the oldest retained disk copy rather than failing the search.
  */
 export async function findStores(
   centre: Coords,
-  radiusM: number
+  radiusM: number,
+  signal?: AbortSignal
 ): Promise<StoreLookup> {
+  signal?.throwIfAborted();
   const cacheCentre = {
     lat: Number(centre.lat.toFixed(CACHE_COORD_DECIMALS)),
     lon: Number(centre.lon.toFixed(CACHE_COORD_DECIMALS)),
@@ -258,12 +402,16 @@ export async function findStores(
     // fallback below is deliberately outside it, so the moment Overpass
     // recovers we go back to live data instead of serving a cached outage
     // for the rest of the day.
-    const stores = await cached(key, TTL.stores, async (): Promise<Store[]> => {
-      const fresh = await diskGet<Store[]>(key, TTL.stores);
-      if (fresh) return fresh.value;
+    const stores = await cached(key, TTL.stores, async (workSignal): Promise<Store[]> => {
+      const fresh = await diskGet<unknown>(key, TTL.stores);
+      const freshStores = normaliseCachedStores(fresh?.value);
+      if (freshStores) return freshStores;
 
       const lookupRadiusM = radiusM + CACHE_CELL_BUFFER_M;
-      const elements = await runOverpass(buildQuery(cacheCentre, lookupRadiusM));
+      const elements = await runOverpass(
+        buildQuery(cacheCentre, lookupRadiusM),
+        workSignal
+      );
 
       const found = dedupeStores(
         elements
@@ -272,14 +420,14 @@ export async function findStores(
           // Overpass `around` is generous at the edges; enforce it ourselves.
           .filter((s) => s.distanceM <= lookupRadiusM)
           .sort((a, b) => a.distanceM - b.distanceM)
-      );
+      ).slice(0, MAX_STORES);
 
       // Never persist an empty result. A transient Overpass failure that slips
       // through would otherwise poison the cache with "no shops here" for a
       // full day, and the disk copy would keep serving it after that.
       if (found.length > 0) await diskSet(key, found);
       return found;
-    });
+    }, { signal });
 
     // Same reasoning as the disk cache: an empty answer is far more likely to
     // be a bad day at Overpass than a genuinely shopless neighbourhood, so let
@@ -288,9 +436,11 @@ export async function findStores(
 
     return { stores: forExactCentre(stores), staleAgeMs: null };
   } catch (err) {
-    const stale = await diskGetStale<Store[]>(key);
-    if (stale) {
-      return { stores: forExactCentre(stale.value), staleAgeMs: stale.ageMs };
+    signal?.throwIfAborted();
+    const stale = await diskGetStale<unknown>(key);
+    const staleStores = normaliseCachedStores(stale?.value);
+    if (stale && staleStores) {
+      return { stores: forExactCentre(staleStores), staleAgeMs: stale.ageMs };
     }
     throw err;
   }
@@ -302,14 +452,28 @@ export async function findStores(
  */
 function dedupeStores(stores: Store[]): Store[] {
   const kept: Store[] = [];
+  const cells = new Map<string, Store[]>();
+  const cellSize = 0.0005;
 
   for (const store of stores) {
-    const duplicate = kept.find(
-      (k) =>
-        k.name.toLowerCase() === store.name.toLowerCase() &&
-        haversine(k.coords, store.coords) < 60
-    );
-    if (!duplicate) kept.push(store);
+    const name = store.name.toLowerCase();
+    const y = Math.floor(store.coords.lat / cellSize);
+    const x = Math.floor(store.coords.lon / cellSize);
+    let duplicate = false;
+
+    for (let dy = -2; dy <= 2 && !duplicate; dy++) {
+      for (let dx = -2; dx <= 2 && !duplicate; dx++) {
+        const nearby = cells.get(`${name}:${y + dy}:${x + dx}`) ?? [];
+        duplicate = nearby.some((candidate) => haversine(candidate.coords, store.coords) < 60);
+      }
+    }
+    if (duplicate) continue;
+
+    kept.push(store);
+    const key = `${name}:${y}:${x}`;
+    const bucket = cells.get(key);
+    if (bucket) bucket.push(store);
+    else cells.set(key, [store]);
   }
 
   return kept;
@@ -335,7 +499,17 @@ export function groupByDomain(stores: Store[]): Map<string, Store[]> {
   // Nearest branch first within each chain.
   for (const branches of groups.values()) {
     branches.sort((a, b) => a.distanceM - b.distanceM);
+    // The UI only needs the nearest branch and a compact alternatives list.
+    // Bound pathological OSM data before it is repeated in the streamed deals.
+    if (branches.length > MAX_BRANCHES_PER_DOMAIN) {
+      branches.splice(MAX_BRANCHES_PER_DOMAIN);
+    }
   }
 
   return groups;
 }
+
+export const __testing = {
+  isOverpassElement,
+  normaliseCachedStores,
+};

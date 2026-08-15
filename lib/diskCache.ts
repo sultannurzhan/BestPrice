@@ -1,5 +1,13 @@
-import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -35,6 +43,15 @@ const DIR =
   process.env.BESTPRICE_CACHE_DIR ??
   (SERVERLESS ? join(tmpdir(), 'bestprice-cache') : join(process.cwd(), '.cache'));
 
+const MAX_DISK_ENTRIES = 300;
+const MAX_DISK_BYTES = 32 * 1024 * 1024;
+const MAX_DISK_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_DISK_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+const PRUNE_EVERY_WRITES = 20;
+const CACHE_FILE = /^[a-f0-9]{20}\.json$/;
+let writesSincePrune = 0;
+let prunePromise: Promise<void> | null = null;
+
 interface Envelope<T> {
   savedAt: number;
   value: T;
@@ -50,9 +67,20 @@ export async function diskGet<T>(
   maxAgeMs: number
 ): Promise<{ value: T; ageMs: number } | null> {
   try {
-    const raw = await readFile(pathFor(key), 'utf8');
+    const path = pathFor(key);
+    const info = await stat(path);
+    if (!info.isFile() || info.size > MAX_DISK_FILE_BYTES) return null;
+    const raw = await readFile(path, 'utf8');
     const parsed = JSON.parse(raw) as Envelope<T>;
-    const ageMs = Date.now() - parsed.savedAt;
+    const now = Date.now();
+    if (
+      !Number.isFinite(parsed.savedAt) ||
+      parsed.savedAt < 0 ||
+      parsed.savedAt > now + 60_000
+    ) {
+      return null;
+    }
+    const ageMs = Math.max(0, now - parsed.savedAt);
     if (ageMs > maxAgeMs) return null;
     return { value: parsed.value, ageMs };
   } catch {
@@ -75,13 +103,82 @@ export async function diskSet<T>(
   value: T,
   savedAt: number = Date.now()
 ): Promise<void> {
+  let tempPath: string | null = null;
   try {
     await mkdir(DIR, { recursive: true });
     const envelope: Envelope<T> = { savedAt, value };
-    await writeFile(pathFor(key), JSON.stringify(envelope), 'utf8');
+    const serialised = JSON.stringify(envelope);
+    if (Buffer.byteLength(serialised, 'utf8') > MAX_DISK_FILE_BYTES) return;
+    const finalPath = pathFor(key);
+    tempPath = join(DIR, `.${randomUUID()}.tmp`);
+    await writeFile(tempPath, serialised, {
+      encoding: 'utf8',
+      flag: 'wx',
+    });
+    await rename(tempPath, finalPath);
+    tempPath = null;
+
+    writesSincePrune++;
+    if (writesSincePrune >= PRUNE_EVERY_WRITES) {
+      writesSincePrune = 0;
+      prunePromise ??= pruneDir(DIR).finally(() => {
+        prunePromise = null;
+      });
+      await prunePromise;
+    }
   } catch {
     // A cache that cannot write is not a reason to fail the request.
+  } finally {
+    if (tempPath) await unlink(tempPath).catch(() => {});
   }
 }
 
-export const __testing = { pathFor, DIR };
+async function pruneDir(dir: string): Promise<void> {
+  try {
+    const entries = (await readdir(dir, { withFileTypes: true })).filter(
+      (entry) => entry.isFile() && CACHE_FILE.test(entry.name)
+    );
+    const files: Array<{ path: string; mtimeMs: number; size: number }> = [];
+
+    for (let i = 0; i < entries.length; i += 50) {
+      const batch = entries.slice(i, i + 50);
+      const inspected = await Promise.all(
+        batch.map(async (entry) => {
+          const path = join(dir, entry.name);
+          const info = await stat(path).catch(() => null);
+          return info?.isFile()
+            ? { path, mtimeMs: info.mtimeMs, size: info.size }
+            : null;
+        })
+      );
+      files.push(...inspected.filter((file): file is NonNullable<typeof file> => file !== null));
+    }
+
+    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const now = Date.now();
+    let kept = 0;
+    let keptBytes = 0;
+    for (const file of files) {
+      const fits =
+        now - file.mtimeMs <= MAX_DISK_AGE_MS &&
+        kept < MAX_DISK_ENTRIES &&
+        keptBytes + file.size <= MAX_DISK_BYTES;
+      if (fits) {
+        kept++;
+        keptBytes += file.size;
+      } else {
+        await unlink(file.path).catch(() => {});
+      }
+    }
+  } catch {
+    // Pruning is maintenance; cache reads and searches must keep working.
+  }
+}
+
+export const __testing = {
+  pathFor,
+  DIR,
+  pruneDir,
+  maxDiskEntries: MAX_DISK_ENTRIES,
+  maxDiskBytes: MAX_DISK_BYTES,
+};
