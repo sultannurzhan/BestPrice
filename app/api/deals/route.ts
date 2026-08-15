@@ -106,7 +106,8 @@ export async function POST(request: Request): Promise<Response> {
       try {
         // ---- 1. Understand the request ---------------------------------
         send({ type: 'status', message: 'Understanding what you are looking for…' });
-        const query = await enrichQuery(parseQuery(item));
+        const query = await enrichQuery(parseQuery(item), request.signal);
+        request.signal.throwIfAborted();
         send({ type: 'query', query });
 
         // ---- 2. Find shops around the user ------------------------------
@@ -116,6 +117,7 @@ export async function POST(request: Request): Promise<Response> {
         });
 
         const { stores, staleAgeMs } = await findStores({ lat, lon }, radiusM);
+        request.signal.throwIfAborted();
         if (staleAgeMs !== null) {
           send({
             type: 'status',
@@ -199,7 +201,8 @@ export async function POST(request: Request): Promise<Response> {
               tookMs: result.tookMs,
             });
             return result;
-          }
+          },
+          { signal: request.signal }
         );
 
         // ---- 4. Match, cost and rank -------------------------------------
@@ -211,7 +214,8 @@ export async function POST(request: Request): Promise<Response> {
           query,
         });
 
-        const verdict = await writeVerdict(deals, query);
+        const verdict = await writeVerdict(deals, query, request.signal);
+        request.signal.throwIfAborted();
 
         send({
           type: 'results',

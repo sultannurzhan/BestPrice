@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   AgentEvent,
   Deal,
@@ -53,8 +53,18 @@ const IDLE: AgentState = {
 export function useAgentSearch() {
   const [state, setState] = useState<AgentState>(IDLE);
   const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
+
+  useEffect(
+    () => () => {
+      requestIdRef.current++;
+      abortRef.current?.abort();
+    },
+    []
+  );
 
   const cancel = useCallback(() => {
+    requestIdRef.current++;
     abortRef.current?.abort();
     abortRef.current = null;
     setState((s) => ({ ...s, running: false, status: null }));
@@ -64,8 +74,13 @@ export function useAgentSearch() {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const requestId = ++requestIdRef.current;
+    const update = (fn: (state: AgentState) => AgentState) => {
+      if (requestIdRef.current === requestId) setState(fn);
+    };
 
     setState({ ...IDLE, running: true, status: 'Starting…' });
+    let terminalEvent = false;
 
     try {
       const res = await fetch('/api/deals', {
@@ -77,7 +92,8 @@ export function useAgentSearch() {
 
       if (!res.ok) {
         const problem = await res.json().catch(() => ({ error: res.statusText }));
-        setState((s) => ({
+        terminalEvent = true;
+        update((s) => ({
           ...s,
           running: false,
           error: problem.error ?? `Request failed (${res.status})`,
@@ -86,7 +102,8 @@ export function useAgentSearch() {
       }
 
       if (!res.body) {
-        setState((s) => ({ ...s, running: false, error: 'No response stream' }));
+        terminalEvent = true;
+        update((s) => ({ ...s, running: false, error: 'No response stream' }));
         return;
       }
 
@@ -100,40 +117,71 @@ export function useAgentSearch() {
 
         buffer += decoder.decode(value, { stream: true });
 
-        // SSE records are separated by a blank line.
-        let split: number;
-        while ((split = buffer.indexOf('\n\n')) !== -1) {
-          const record = buffer.slice(0, split);
-          buffer = buffer.slice(split + 2);
+        // Accept both LF and CRLF separators; proxies are allowed to normalize
+        // line endings even though our own route emits LF.
+        for (;;) {
+          const separator = buffer.match(/\r?\n\r?\n/);
+          if (separator?.index === undefined) break;
+          const record = buffer.slice(0, separator.index);
+          buffer = buffer.slice(separator.index + separator[0].length);
 
-          const line = record.split('\n').find((l) => l.startsWith('data: '));
-          if (!line) continue;
-
-          let event: AgentEvent;
-          try {
-            event = JSON.parse(line.slice(6));
-          } catch {
-            continue;
-          }
-
-          setState((prev) => reduce(prev, event));
+          const event = parseSseRecord(record);
+          if (!event) continue;
+          if (event.type === 'results' || event.type === 'error') terminalEvent = true;
+          update((prev) => reduce(prev, event));
         }
       }
 
-      setState((s) => ({ ...s, running: false, status: null }));
+      // A well-formed SSE stream ends records with a blank line, but process a
+      // final complete data line too so intermediary buffering cannot discard
+      // the terminal result.
+      buffer += decoder.decode();
+      const finalEvent = parseSseRecord(buffer);
+      if (finalEvent) {
+        if (finalEvent.type === 'results' || finalEvent.type === 'error') {
+          terminalEvent = true;
+        }
+        update((prev) => reduce(prev, finalEvent));
+      }
+
+      if (!terminalEvent) {
+        update((s) => ({
+          ...s,
+          running: false,
+          status: null,
+          error: 'The search ended before results arrived. Please try again.',
+        }));
+      }
     } catch (err) {
       if (controller.signal.aborted) return;
-      setState((s) => ({
+      update((s) => ({
         ...s,
         running: false,
         error: err instanceof Error ? err.message : 'Search failed',
       }));
+    } finally {
+      if (requestIdRef.current === requestId) abortRef.current = null;
     }
   }, []);
 
-  const reset = useCallback(() => setState(IDLE), []);
+  const reset = useCallback(() => {
+    requestIdRef.current++;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setState(IDLE);
+  }, []);
 
   return { state, run, cancel, reset };
+}
+
+function parseSseRecord(record: string): AgentEvent | null {
+  const line = record.split(/\r?\n/).find((candidate) => candidate.startsWith('data: '));
+  if (!line) return null;
+  try {
+    return JSON.parse(line.slice(6)) as AgentEvent;
+  } catch {
+    return null;
+  }
 }
 
 function reduce(prev: AgentState, event: AgentEvent): AgentState {
@@ -181,3 +229,5 @@ function reduce(prev: AgentState, event: AgentEvent): AgentState {
       return prev;
   }
 }
+
+export const __testing = { parseSseRecord, reduce };

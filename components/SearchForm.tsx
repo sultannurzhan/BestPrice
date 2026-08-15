@@ -98,6 +98,9 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
           onChange={(e) => setItem(e.target.value)}
           autoComplete="off"
           spellCheck={false}
+          maxLength={120}
+          required
+          enterKeyHint="search"
           disabled={running}
         />
       </div>

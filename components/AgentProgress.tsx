@@ -37,7 +37,11 @@ export function AgentProgress({
   const done = progress.filter((p) => p.state === 'done').length;
 
   return (
-    <div className="card p-4 sm:p-5 fade-up">
+    <div
+      className="card p-4 sm:p-5 fade-up"
+      aria-live="polite"
+      aria-busy={running}
+    >
       {/* headline status */}
       <div className="flex items-center gap-2.5 mb-1">
         {running && (

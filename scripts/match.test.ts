@@ -10,7 +10,8 @@ import { test } from 'node:test';
 
 import { detectCategory, matchListing, parseQuery } from '../lib/product';
 import { computeCost } from '../lib/rank';
-import type { Listing } from '../lib/types';
+import { __testing as llmTesting } from '../lib/llm';
+import type { Deal, Listing } from '../lib/types';
 
 function listing(title: string, price: number): Listing {
   return {
@@ -190,4 +191,23 @@ test('a cheaper distant shop can lose to a dearer close one', () => {
     close.total < distant.total,
     `close ${close.total} should beat distant ${distant.total}`
   );
+});
+
+test('the fallback verdict never invents that the cheapest shop is closest', () => {
+  const deal = (name: string, price: number, total: number, distanceKm: number) =>
+    ({
+      store: { name },
+      listing: { price, inStock: true },
+      cost: { total, distanceKm },
+      match: { confidence: 0.9 },
+    }) as Deal;
+
+  const verdictText = llmTesting.ruleVerdict([
+    deal('Far Shop', 100_000, 103_000, 12),
+    deal('Near Shop', 101_000, 104_000, 1),
+  ]);
+
+  assert.ok(verdictText);
+  assert.doesNotMatch(verdictText, /closest/i);
+  assert.match(verdictText, /including travel/i);
 });

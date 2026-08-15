@@ -343,13 +343,15 @@ export const __testing = { isPrivateOrReservedIp, assertPublicHttpUrl, readBody 
 export async function pooled<T, R>(
   items: T[],
   limit: number,
-  fn: (item: T, index: number) => Promise<R>
+  fn: (item: T, index: number) => Promise<R>,
+  { signal }: { signal?: AbortSignal } = {}
 ): Promise<R[]> {
   const results = new Array<R>(items.length);
   let cursor = 0;
 
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
     for (;;) {
+      signal?.throwIfAborted();
       const i = cursor++;
       if (i >= items.length) return;
       results[i] = await fn(items[i], i);

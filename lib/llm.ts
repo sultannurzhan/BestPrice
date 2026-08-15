@@ -26,6 +26,7 @@ interface ChatOptions {
   user: string;
   maxTokens?: number;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 async function chat({
@@ -33,6 +34,7 @@ async function chat({
   user,
   maxTokens = 300,
   timeoutMs = 12_000,
+  signal,
 }: ChatOptions): Promise<string | null> {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return null;
@@ -56,7 +58,9 @@ async function chat({
         max_tokens: maxTokens,
         temperature: 0.2,
       }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs),
     });
 
     if (!res.ok) return null;
@@ -100,13 +104,17 @@ Do not invent details the user did not give.`;
  * Refine a rule-parsed query with the LLM. Anything the model returns is
  * validated before use, and any failure keeps the rule-based result.
  */
-export async function enrichQuery(base: ProductQuery): Promise<ProductQuery> {
+export async function enrichQuery(
+  base: ProductQuery,
+  signal?: AbortSignal
+): Promise<ProductQuery> {
   if (!isLlmEnabled()) return base;
 
   const raw = await chat({
     system: PARSE_SYSTEM,
     user: base.raw,
     maxTokens: 220,
+    signal,
   });
   if (!raw) return base;
 
@@ -155,17 +163,9 @@ function ruleVerdict(deals: Deal[]): string | null {
   const cheapestSticker = deals.reduce((a, b) =>
     a.listing.price <= b.listing.price ? a : b
   );
-
-  if (best !== cheapestSticker) {
-    const saved = cheapestSticker.cost.total - best.cost.total;
-    return `${best.store.name} wins on total cost: ${formatKzt(
-      best.listing.price
-    )} at ${best.cost.distanceKm} km beats the ${formatKzt(
-      cheapestSticker.listing.price
-    )} at ${cheapestSticker.store.name} once the ${cheapestSticker.cost.distanceKm} km round trip is priced in (${formatKzt(
-      saved
-    )} better).`;
-  }
+  const cheapestTotal = deals.reduce((a, b) =>
+    a.cost.total <= b.cost.total ? a : b
+  );
 
   if (deals.length === 1) {
     return `Only one nearby shop had a readable listing: ${best.store.name} at ${formatKzt(
@@ -173,11 +173,38 @@ function ruleVerdict(deals: Deal[]): string | null {
     )}.`;
   }
 
-  const runnerUp = deals[1];
-  const gap = runnerUp.cost.total - best.cost.total;
-  return `${best.store.name} is both cheapest and closest at ${formatKzt(
+  if (best === cheapestTotal && best !== cheapestSticker) {
+    const saved = cheapestSticker.cost.total - best.cost.total;
+    return `${best.store.name} wins on total cost: ${formatKzt(
+      best.listing.price
+    )} at ${best.cost.distanceKm} km beats the ${formatKzt(
+      cheapestSticker.listing.price
+    )} at ${cheapestSticker.store.name} once its ${cheapestSticker.cost.distanceKm} km distance is priced in (${formatKzt(
+      saved
+    )} better).`;
+  }
+
+  if (best === cheapestTotal) {
+    const runnerUp = deals[1];
+    const gap = runnerUp.cost.total - best.cost.total;
+    return `${best.store.name} is the best-value option at ${formatKzt(
+      best.listing.price
+    )} (${formatKzt(best.cost.total)} including travel), ${formatKzt(
+      gap
+    )} below the next ranked option.`;
+  }
+
+  const caveat =
+    cheapestTotal.listing.inStock === false
+      ? 'is marked out of stock'
+      : cheapestTotal.match.confidence < best.match.confidence
+        ? 'is a lower-confidence match'
+        : 'has a weaker availability or match signal';
+  return `${best.store.name} ranks first as the stronger available match at ${formatKzt(
     best.listing.price
-  )} — ${formatKzt(gap)} better than the next option once travel is counted.`;
+  )}; ${cheapestTotal.store.name} has the lower estimated total at ${formatKzt(
+    cheapestTotal.cost.total
+  )}, but ${caveat}.`;
 }
 
 const VERDICT_SYSTEM = `You write a single-sentence verdict for a price comparison tool in Kazakhstan.
@@ -187,7 +214,8 @@ No greetings, no markdown, no more than 40 words. Never invent prices or shops.`
 
 export async function writeVerdict(
   deals: Deal[],
-  query: ProductQuery
+  query: ProductQuery,
+  signal?: AbortSignal
 ): Promise<string | null> {
   const fallback = ruleVerdict(deals);
   if (!isLlmEnabled() || deals.length === 0) return fallback;
@@ -208,7 +236,10 @@ export async function writeVerdict(
     system: VERDICT_SYSTEM,
     user: `Shopper wants: ${query.raw}\n\nRanked options:\n${table}`,
     maxTokens: 120,
+    signal,
   });
 
   return answer ?? fallback;
 }
+
+export const __testing = { ruleVerdict };

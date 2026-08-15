@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { MAX_RESPONSE_BYTES, politeFetch, __testing } from '../lib/fetcher';
+import { MAX_RESPONSE_BYTES, politeFetch, pooled, __testing } from '../lib/fetcher';
 
 const realFetch = globalThis.fetch;
 
@@ -95,4 +95,25 @@ test('recognises public and reserved address ranges', () => {
   assert.equal(__testing.isPrivateOrReservedIp('::1'), true);
   assert.equal(__testing.isPrivateOrReservedIp('2001:4860:4860::8888'), false);
   assert.equal(__testing.isPrivateOrReservedIp('::ffff:127.0.0.1'), true);
+});
+
+test('the worker pool stops scheduling work after cancellation', async () => {
+  const controller = new AbortController();
+  const started: number[] = [];
+
+  await assert.rejects(
+    () =>
+      pooled(
+        [1, 2, 3],
+        1,
+        async (item) => {
+          started.push(item);
+          controller.abort();
+          return item;
+        },
+        { signal: controller.signal }
+      ),
+    (err: unknown) => err === controller.signal.reason
+  );
+  assert.deepEqual(started, [1]);
 });
