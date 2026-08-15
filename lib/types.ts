@@ -45,6 +45,10 @@ export type ScrapeFailure =
   | 'js-rendered'
   | 'no-listings'
   | 'no-match'
+  /** Rejected because the URL or one of its redirects targets a non-public host. */
+  | 'unsafe-url'
+  /** The retailer response exceeded the bounded HTML parsing budget. */
+  | 'response-too-large'
   | 'timeout';
 
 export interface DomainResult {

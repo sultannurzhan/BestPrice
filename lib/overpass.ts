@@ -164,7 +164,10 @@ function normaliseDomain(raw: string | undefined): {
   if (!trimmed) return { domain: null, website: null };
 
   try {
-    const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
+    const url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+      return { domain: null, website: null };
+    }
     return {
       domain: url.hostname.replace(/^www\./i, '').toLowerCase(),
       website: url.origin,

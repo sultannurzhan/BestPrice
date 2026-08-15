@@ -37,8 +37,11 @@ const SCRAPE_CONCURRENCY = 6;
 const GAP_REASON: Partial<Record<ScrapeFailure, string>> = {
   blocked: 'blocks automated price checks',
   'js-rendered': 'shows prices only after running JavaScript',
+  'no-search-endpoint': 'has no readable website search',
   timeout: 'did not respond in time',
   unreachable: 'was unreachable',
+  'unsafe-url': 'has an invalid or non-public website address',
+  'response-too-large': 'returned a page too large to check safely',
 };
 
 function formatAge(ms: number): string {

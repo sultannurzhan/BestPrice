@@ -12,6 +12,8 @@ const FAILURE_LABEL: Record<ScrapeFailure, string> = {
   'js-rendered': 'needs JavaScript',
   'no-listings': 'nothing found',
   'no-match': 'no matches',
+  'unsafe-url': 'invalid website',
+  'response-too-large': 'page too large',
   timeout: 'timed out',
 };
 
