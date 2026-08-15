@@ -213,6 +213,8 @@ scripts/
 npm run dev      # development server
 npm run build    # production build
 npm test         # matcher + cost-model tests
+npm run lint     # ESLint (Next.js and TypeScript rules)
+npm run check    # lint + typecheck + tests + production build
 ```
 
 Diagnose a retailer — use this when a shop stops returning results, since sites

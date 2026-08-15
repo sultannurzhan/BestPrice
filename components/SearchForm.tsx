@@ -37,7 +37,6 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
   // Ask for location on first paint — it is the one thing the app cannot guess.
   useEffect(() => {
     requestLocation();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function requestLocation() {
