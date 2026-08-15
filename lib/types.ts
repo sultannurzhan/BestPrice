@@ -82,18 +82,21 @@ export interface ProductQuery {
   via: 'rules' | 'llm';
 }
 
-export type ProductCategory =
-  | 'smartphone'
-  | 'laptop'
-  | 'tablet'
-  | 'tv'
-  | 'headphones'
-  | 'smartwatch'
-  | 'monitor'
-  | 'console'
-  | 'camera'
-  | 'component'
-  | 'other';
+export const PRODUCT_CATEGORIES = [
+  'smartphone',
+  'laptop',
+  'tablet',
+  'tv',
+  'headphones',
+  'smartwatch',
+  'monitor',
+  'console',
+  'camera',
+  'component',
+  'other',
+] as const;
+
+export type ProductCategory = (typeof PRODUCT_CATEGORIES)[number];
 
 /** A listing joined to the stores that sell it, with the ranking maths applied. */
 export interface Deal {

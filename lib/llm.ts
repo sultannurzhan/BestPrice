@@ -1,4 +1,4 @@
-import type { Deal, ProductQuery } from './types';
+import { PRODUCT_CATEGORIES, type Deal, type ProductQuery } from './types';
 import { formatKzt } from './rank';
 
 /**
@@ -127,6 +127,11 @@ export async function enrichQuery(base: ProductQuery): Promise<ProductQuery> {
     : [];
 
   const searchTerm = str(parsed.searchTerm);
+  const category =
+    typeof parsed.category === 'string' &&
+    PRODUCT_CATEGORIES.includes(parsed.category as (typeof PRODUCT_CATEGORIES)[number])
+      ? (parsed.category as ProductQuery['category'])
+      : base.category;
 
   return {
     ...base,
@@ -135,10 +140,7 @@ export async function enrichQuery(base: ProductQuery): Promise<ProductQuery> {
     model: str(parsed.model) ?? base.model,
     storageGb: num(parsed.storageGb) ?? base.storageGb,
     ramGb: num(parsed.ramGb) ?? base.ramGb,
-    category:
-      (typeof parsed.category === 'string' &&
-        (parsed.category as ProductQuery['category'])) ||
-      base.category,
+    category,
     // Trust the model only if it gave us something usable.
     requiredTokens: tokens.length >= 1 ? tokens : base.requiredTokens,
     via: 'llm',

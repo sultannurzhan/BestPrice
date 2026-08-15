@@ -253,30 +253,101 @@ function tokenize(text: string): string[] {
     .filter((t) => t.length > 0 && !STOP_WORDS.has(t));
 }
 
-/** Storage sizes appear as "256", "256gb", "256 гб", "1tb". */
-function extractStorage(raw: string): number | null {
-  const tb = raw.match(/(\d+(?:[.,]\d+)?)\s*(?:tb|тб)(?![\p{L}\p{N}])/iu);
-  if (tb) return Math.round(parseFloat(tb[1].replace(',', '.')) * 1024);
-
-  const gb = raw.match(/(\d{2,4})\s*(?:gb|гб)(?![\p{L}\p{N}])/iu);
-  if (gb) return parseInt(gb[1], 10);
-
-  // Bare storage-looking number: these values are unambiguous in practice.
-  const bare = raw.match(/(?<![\p{L}\p{N}])(64|128|256|512)(?![\p{L}\p{N}])/u);
-  if (bare) return parseInt(bare[1], 10);
-
-  return null;
+interface Capacities {
+  storageGb: number | null;
+  ramGb: number | null;
 }
 
-function extractRam(raw: string): number | null {
-  // "16/512" style: RAM before the slash.
-  const combo = raw.match(/(?<![\p{L}\p{N}])(\d{1,2})\s*\/\s*(\d{2,4})(?![\p{L}\p{N}])/u);
-  if (combo) return parseInt(combo[1], 10);
+interface CapacityMention {
+  valueGb: number;
+  index: number;
+  end: number;
+  unit: 'gb' | 'tb';
+}
 
-  const ram = raw.match(/(\d{1,2})\s*(?:gb|гб)\s*(?:ram|озу|оперативн)/iu);
-  if (ram) return parseInt(ram[1], 10);
+/**
+ * Read RAM and storage together instead of letting two independent regexes both
+ * claim the first capacity in a title. Retailers commonly write variants as
+ * `16GB 512GB`, `16/512GB`, or `16 GB RAM / 1 TB SSD`.
+ */
+function extractCapacities(
+  raw: string,
+  category: ProductCategory | null = null
+): Capacities {
+  const combo = raw.match(
+    /(?<![\p{L}\p{N}])(\d{1,3})\s*\/\s*(\d{2,4})\s*(?:gb|гб)?(?![\p{L}\p{N}])/iu
+  );
+  if (combo) {
+    return {
+      ramGb: parseInt(combo[1], 10),
+      storageGb: parseInt(combo[2], 10),
+    };
+  }
 
-  return null;
+  const mentions: CapacityMention[] = [];
+  const capacityRe = /(\d+(?:[.,]\d+)?)\s*(tb|тб|gb|гб)(?![\p{L}\p{N}])/giu;
+  let match: RegExpExecArray | null;
+  while ((match = capacityRe.exec(raw))) {
+    const unit = /tb|тб/i.test(match[2]) ? 'tb' : 'gb';
+    const numeric = parseFloat(match[1].replace(',', '.'));
+    const valueGb = unit === 'tb' ? Math.round(numeric * 1024) : Math.round(numeric);
+    if (valueGb > 0 && valueGb <= 16_384) {
+      mentions.push({ valueGb, index: match.index, end: match.index + match[0].length, unit });
+    }
+  }
+
+  let ramGb: number | null = null;
+  let storageGb: number | null = null;
+  const unclassified: CapacityMention[] = [];
+
+  for (const mention of mentions) {
+    const before = raw.slice(Math.max(0, mention.index - 28), mention.index);
+    const after = raw.slice(mention.end, mention.end + 28);
+    const ramBefore = /(?:ram|озу|оперативн\w*)\s*$/iu.test(before);
+    const ramAfter = /^\s*(?:ram|озу|оперативн)/iu.test(after);
+    const storageBefore = /(?:ssd|hdd|storage|накопител\w*|встроен\w*\s+памят\w*)\s*$/iu.test(
+      before
+    );
+    const storageAfter = /^\s*(?:ssd|hdd|storage|накопител|встроен\w*\s+памят)/iu.test(
+      after
+    );
+
+    if (mention.unit === 'tb' || storageBefore || storageAfter) {
+      storageGb ??= mention.valueGb;
+    } else if (ramBefore || ramAfter) {
+      ramGb ??= mention.valueGb;
+    } else {
+      unclassified.push(mention);
+    }
+  }
+
+  // With two unlabeled capacities, shops conventionally put RAM first and the
+  // larger storage value second: `8GB 256GB`, `16 GB / 512 GB`.
+  if (unclassified.length >= 2) {
+    const values = unclassified.map((m) => m.valueGb);
+    const largest = Math.max(...values);
+    storageGb ??= largest;
+    const ramCandidate = unclassified.find(
+      (m) => m.valueGb !== largest && m.valueGb <= 128
+    );
+    ramGb ??= ramCandidate?.valueGb ?? null;
+  } else if (unclassified.length === 1) {
+    const value = unclassified[0].valueGb;
+    // A lone small capacity on a laptop query is almost always RAM. On phones
+    // and tablets the same number can legitimately be storage.
+    if (category === 'laptop' && value <= 64) ramGb ??= value;
+    else storageGb ??= value;
+  }
+
+  if (storageGb === null) {
+    // Bare storage-looking numbers are useful in queries such as
+    // `iPhone 15 256`; model identifiers remain intact because only canonical
+    // capacity values qualify.
+    const bare = raw.match(/(?<![\p{L}\p{N}])(64|128|256|512)(?![\p{L}\p{N}])/u);
+    if (bare) storageGb = parseInt(bare[1], 10);
+  }
+
+  return { storageGb, ramGb };
 }
 
 /** Is the shopper asking for the accessory itself rather than the device? */
@@ -301,21 +372,26 @@ export function parseQuery(raw: string): ProductQuery {
 
   const brand =
     BRANDS.find((b) => hasWord(lower, b)) ?? null;
-  const storageGb = extractStorage(trimmed);
-  const ramGb = extractRam(trimmed);
   const accessoryLabel = detectAccessoryQuery(trimmed);
 
   // An accessory query ("чехол для iphone 15") is not a smartphone purchase,
   // so it must not inherit the smartphone price floor.
   const category = accessoryLabel ? 'other' : detectCategory(trimmed);
+  const { storageGb, ramGb } = extractCapacities(trimmed, category);
 
   const capacityStrings = new Set(
     [storageGb, ramGb].filter((n): n is number => n !== null).map(String)
   );
+  if (storageGb !== null && storageGb >= 1024 && storageGb % 1024 === 0) {
+    capacityStrings.add(String(storageGb / 1024));
+  }
 
   const requiredTokens = tokens.filter((t) => {
     if (capacityStrings.has(t)) return false;
     if (CAPACITY_TOKEN.test(t)) return false;
+    if (category !== 'component' && /^(?:ram|озу|ssd|hdd|storage)$/iu.test(t)) {
+      return false;
+    }
     // Very long digit runs are SKUs, not something to match on.
     if (/^\d+$/.test(t) && t.length > 4) return false;
     return true;
@@ -323,7 +399,7 @@ export function parseQuery(raw: string): ProductQuery {
 
   return {
     raw: trimmed,
-    searchTerm: buildSearchTerm(trimmed),
+    searchTerm: buildSearchTerm(trimmed, category),
     brand,
     model: requiredTokens.join(' ') || null,
     storageGb,
@@ -339,11 +415,23 @@ export function parseQuery(raw: string): ProductQuery {
  * What we actually type into the retailer's search box. Retailer search engines
  * do badly with capacity qualifiers, so we drop them and filter afterwards.
  */
-function buildSearchTerm(raw: string): string {
-  return raw
+function buildSearchTerm(raw: string, category: ProductCategory | null): string {
+  let term = raw
+    .replace(
+      /(?<![\p{L}\p{N}])\d{1,3}\s*\/\s*\d{2,4}\s*(?:gb|гб)?(?![\p{L}\p{N}])/giu,
+      ' '
+    )
     .replace(/\d+\s*(?:gb|гб|tb|тб)(?![\p{L}\p{N}])/giu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/(?<![\p{L}\p{N}])(64|128|256|512)(?![\p{L}\p{N}])/gu, ' ');
+
+  if (category !== 'component') {
+    term = term.replace(
+      /(?<![\p{L}\p{N}])(?:ram|озу|ssd|hdd|storage)(?![\p{L}\p{N}])/giu,
+      ' '
+    );
+  }
+
+  return term.replace(/\s+/g, ' ').trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -430,13 +518,24 @@ export function matchListing(listing: Listing, query: ProductQuery): MatchResult
   let confidence = 0.5 + 0.4 * coverage;
 
   if (query.storageGb !== null) {
-    const titleStorage = extractStorage(title);
+    const titleStorage = extractCapacities(title, query.category).storageGb;
     if (titleStorage !== null) {
       if (titleStorage === query.storageGb) confidence = Math.min(1, confidence + 0.1);
       else return REJECT(`wrong storage (${titleStorage}GB, wanted ${query.storageGb}GB)`);
     } else {
       // Storage unstated — plausible but less certain.
       confidence -= 0.1;
+    }
+  }
+
+  if (query.ramGb !== null) {
+    const titleRam = extractCapacities(title, query.category).ramGb;
+    if (titleRam !== null) {
+      if (titleRam === query.ramGb) confidence = Math.min(1, confidence + 0.05);
+      else return REJECT(`wrong RAM (${titleRam}GB, wanted ${query.ramGb}GB)`);
+    } else {
+      // RAM unstated — keep the listing visible, but below an exact variant.
+      confidence -= 0.08;
     }
   }
 

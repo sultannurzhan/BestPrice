@@ -133,6 +133,46 @@ test('parses storage and strips it from the search term', () => {
   assert.ok(!/256/.test(q.searchTerm), `searchTerm kept capacity: ${q.searchTerm}`);
 });
 
+test('strips a bare storage capacity from the retailer search term', () => {
+  const q = parseQuery('iPhone 15 Pro 256');
+  assert.equal(q.storageGb, 256);
+  assert.equal(q.searchTerm, 'iPhone 15 Pro');
+  assert.ok(!q.requiredTokens.includes('256'));
+});
+
+test('distinguishes RAM from storage in common variant formats', () => {
+  const spaced = parseQuery('MacBook Air M2 16GB 512GB');
+  assert.equal(spaced.ramGb, 16);
+  assert.equal(spaced.storageGb, 512);
+  assert.equal(spaced.searchTerm, 'MacBook Air M2');
+
+  const compact = parseQuery('Samsung Galaxy A17 8/256GB');
+  assert.equal(compact.ramGb, 8);
+  assert.equal(compact.storageGb, 256);
+  assert.equal(compact.searchTerm, 'Samsung Galaxy A17');
+
+  const labelled = parseQuery('MacBook Air M2 16 GB RAM 1 TB SSD');
+  assert.equal(labelled.ramGb, 16);
+  assert.equal(labelled.storageGb, 1024);
+});
+
+test('enforces RAM when the shopper specified a variant', () => {
+  const wrong = verdict(
+    'MacBook Air M2 16GB 512GB',
+    'Apple MacBook Air M2 8GB 512GB Midnight',
+    599_990
+  );
+  assert.equal(wrong.rejected, true);
+  assert.match(wrong.rejectReason ?? '', /wrong RAM/);
+
+  const right = verdict(
+    'MacBook Air M2 16GB 512GB',
+    'Apple MacBook Air M2 16GB 512GB Midnight',
+    649_990
+  );
+  assert.equal(right.rejected, false);
+});
+
 test('travel cost grows with distance and is symmetric', () => {
   const near = computeCost(100_000, 500);
   const far = computeCost(100_000, 20_000);
