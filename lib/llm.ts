@@ -96,8 +96,6 @@ Return ONLY a JSON object with these keys:
   "storageGb": number|null
   "ramGb": number|null
   "category": one of "smartphone","laptop","tablet","tv","headphones","smartwatch","monitor","console","camera","component","other"
-  "requiredTokens": string[] - lowercase tokens that MUST appear in a matching product title
-Keep requiredTokens short (2-4 items) and never include storage numbers there.
 Do not invent details the user did not give.`;
 
 /**
@@ -121,36 +119,55 @@ export async function enrichQuery(
   const parsed = extractJson(raw) as Record<string, unknown> | null;
   if (!parsed) return base;
 
+  return mergeEnrichment(base, parsed);
+}
+
+function mergeEnrichment(
+  base: ProductQuery,
+  parsed: Record<string, unknown>
+): ProductQuery {
+
   const str = (v: unknown): string | null =>
     typeof v === 'string' && v.trim() ? v.trim().toLowerCase() : null;
-  const num = (v: unknown): number | null =>
-    typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
+  const num = (v: unknown, max: number): number | null =>
+    typeof v === 'number' && Number.isInteger(v) && v > 0 && v <= max
+      ? v
+      : null;
 
-  const tokens = Array.isArray(parsed.requiredTokens)
-    ? parsed.requiredTokens
-        .filter((t): t is string => typeof t === 'string')
-        .map((t) => t.trim().toLowerCase())
-        .filter((t) => t.length > 0)
-        .slice(0, 6)
-    : [];
-
-  const searchTerm = str(parsed.searchTerm);
-  const category =
+  const proposedSearchTerm = str(parsed.searchTerm);
+  const proposedSearchTokens = new Set(
+    (proposedSearchTerm ?? '')
+      .replace(/([\p{L}\p{N}])\+/gu, '$1 plus ')
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(Boolean)
+  );
+  const searchTerm =
+    proposedSearchTerm &&
+    base.requiredTokens.every((token) =>
+      proposedSearchTokens.has(token.replace(/\+/g, 'plus'))
+    )
+      ? proposedSearchTerm
+      : base.searchTerm;
+  const proposedCategory =
     typeof parsed.category === 'string' &&
     PRODUCT_CATEGORIES.includes(parsed.category as (typeof PRODUCT_CATEGORIES)[number])
       ? (parsed.category as ProductQuery['category'])
-      : base.category;
+      : null;
 
   return {
     ...base,
-    searchTerm: searchTerm ?? base.searchTerm,
-    brand: str(parsed.brand) ?? base.brand,
-    model: str(parsed.model) ?? base.model,
-    storageGb: num(parsed.storageGb) ?? base.storageGb,
-    ramGb: num(parsed.ramGb) ?? base.ramGb,
-    category,
-    // Trust the model only if it gave us something usable.
-    requiredTokens: tokens.length >= 1 ? tokens : base.requiredTokens,
+    searchTerm,
+    brand: base.brand ?? str(parsed.brand),
+    model: base.model ?? str(parsed.model),
+    storageGb: base.storageGb ?? num(parsed.storageGb, 16_384),
+    ramGb: base.ramGb ?? num(parsed.ramGb, 512),
+    // A known rule-derived category is an invariant, especially `other` for an
+    // accessory query. Let the model fill only genuinely unknown categories.
+    category: base.category ?? proposedCategory,
+    // Deterministic constraints are invariants. Rule parsing already retains
+    // every meaningful raw token, so model-authored constraints can only make
+    // matching less reliable or smuggle conversational noise back in.
+    requiredTokens: base.requiredTokens,
     via: 'llm',
   };
 }
@@ -159,6 +176,10 @@ export async function enrichQuery(
 function ruleVerdict(deals: Deal[]): string | null {
   const best = deals[0];
   if (!best) return null;
+  const qualifyUnknownStock = (message: string) =>
+    best.listing.inStock === null
+      ? `${message} Branch stock is unverified.`
+      : message;
 
   const cheapestSticker = deals.reduce((a, b) =>
     a.listing.price <= b.listing.price ? a : b
@@ -168,30 +189,40 @@ function ruleVerdict(deals: Deal[]): string | null {
   );
 
   if (deals.length === 1) {
-    return `Only one nearby shop had a readable listing: ${best.store.name} at ${formatKzt(
+    const availability =
+      best.listing.inStock === false
+        ? ' It is marked out of stock online.'
+        : '';
+    return qualifyUnknownStock(`Only one nearby shop had a readable listing: ${best.store.name} at ${formatKzt(
+      best.listing.price
+    )}.${availability}`);
+  }
+
+  if (deals.every((deal) => deal.listing.inStock === false)) {
+    return `Every readable matching listing is marked out of stock; ${best.store.name} has the lowest ranked unavailable option at ${formatKzt(
       best.listing.price
     )}.`;
   }
 
   if (best === cheapestTotal && best !== cheapestSticker) {
     const saved = cheapestSticker.cost.total - best.cost.total;
-    return `${best.store.name} wins on total cost: ${formatKzt(
+    return qualifyUnknownStock(`${best.store.name} wins on total cost: ${formatKzt(
       best.listing.price
     )} at ${best.cost.distanceKm} km beats the ${formatKzt(
       cheapestSticker.listing.price
     )} at ${cheapestSticker.store.name} once its ${cheapestSticker.cost.distanceKm} km distance is priced in (${formatKzt(
       saved
-    )} better).`;
+    )} better).`);
   }
 
   if (best === cheapestTotal) {
     const runnerUp = deals[1];
     const gap = runnerUp.cost.total - best.cost.total;
-    return `${best.store.name} is the best-value option at ${formatKzt(
+    return qualifyUnknownStock(`${best.store.name} is the best-value option at ${formatKzt(
       best.listing.price
     )} (${formatKzt(best.cost.total)} including travel), ${formatKzt(
       gap
-    )} below the next ranked option.`;
+    )} below the next ranked option.`);
   }
 
   const caveat =
@@ -200,17 +231,86 @@ function ruleVerdict(deals: Deal[]): string | null {
       : cheapestTotal.match.confidence < best.match.confidence
         ? 'is a lower-confidence match'
         : 'has a weaker availability or match signal';
-  return `${best.store.name} ranks first as the stronger available match at ${formatKzt(
+  return qualifyUnknownStock(`${best.store.name} ranks first as the stronger available match at ${formatKzt(
     best.listing.price
   )}; ${cheapestTotal.store.name} has the lower estimated total at ${formatKzt(
     cheapestTotal.cost.total
-  )}, but ${caveat}.`;
+  )}, but ${caveat}.`);
 }
 
 const VERDICT_SYSTEM = `You write a single-sentence verdict for a price comparison tool in Kazakhstan.
 Be concrete and factual: name the shop, the price, and the reason it wins.
 Mention travel cost only if it changed the ranking. Prices are in tenge (₸).
+Never call an out-of-stock listing available; clearly say when stock is unverified.
 No greetings, no markdown, no more than 40 words. Never invent prices or shops.`;
+
+function verdictIsGrounded(answer: string, deals: Deal[]): boolean {
+  const best = deals[0];
+  if (!best || answer.length > 320 || answer.trim().split(/\s+/).length > 50) return false;
+  const lower = answer.toLowerCase();
+  if (!lower.includes(best.store.name.toLowerCase())) return false;
+
+  const numberGroups = (text: string): string[] =>
+    [...text.matchAll(/\d{1,3}(?:[\s\u00a0\u202f.,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?/g)].map((match) =>
+      match[0].replace(/\D/g, '')
+    );
+  const allowedNumbers = new Set<string>();
+  const allowedMoney = new Set<string>();
+  const allow = (value: unknown) => {
+    for (const group of numberGroups(String(value))) allowedNumbers.add(group);
+  };
+  const allowMoney = (value: number | undefined) => {
+    if (value === undefined) return;
+    const normalized = String(Math.round(value));
+    allowedNumbers.add(normalized);
+    allowedMoney.add(normalized);
+  };
+  for (const deal of deals.slice(0, 6)) {
+    allow(deal.store.name);
+    allow(deal.listing.title);
+    for (const value of [deal.cost?.distanceKm, deal.cost?.minutesOneWay]) {
+      if (value !== undefined) allow(value);
+    }
+    for (const value of [
+      deal.listing.price,
+      deal.cost?.price,
+      deal.cost?.travel,
+      deal.cost?.timeCost,
+      deal.cost?.total,
+      deal.cost ? deal.cost.travel + deal.cost.timeCost : undefined,
+    ]) {
+      allowMoney(value);
+    }
+  }
+  // A concise verdict may state the exact gap between ranked total costs.
+  for (let i = 0; i < Math.min(6, deals.length); i++) {
+    for (let j = i + 1; j < Math.min(6, deals.length); j++) {
+      if (deals[i].cost && deals[j].cost) {
+        allowMoney(Math.abs(deals[i].cost.total - deals[j].cost.total));
+      }
+    }
+  }
+
+  const answerNumbers = numberGroups(answer);
+  if (!answerNumbers.includes(String(Math.round(best.listing.price)))) return false;
+  if (answerNumbers.some((number) => !allowedNumbers.has(number))) return false;
+  const moneyClaims = [
+    ...answer.matchAll(
+      /(\d{1,3}(?:[\s\u00a0\u202f.,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)\s*(?:₸|KZT|тенге)/giu
+    ),
+  ].map((match) => match[1].replace(/\D/g, ''));
+  if (moneyClaims.some((number) => !allowedMoney.has(number))) return false;
+  if (best.listing.inStock === false && !/(?:out of stock|unavailable)/i.test(answer)) {
+    return false;
+  }
+  if (
+    best.listing.inStock === null &&
+    !/(?:unverified|unknown|confirm|verify)/i.test(answer)
+  ) {
+    return false;
+  }
+  return true;
+}
 
 export async function writeVerdict(
   deals: Deal[],
@@ -228,7 +328,13 @@ export async function writeVerdict(
           d.listing.price
         }₸ | ${d.cost.distanceKm}km | travel+time ${d.cost.travel + d.cost.timeCost}₸ | total ${
           d.cost.total
-        }₸`
+        }₸ | stock ${
+          d.listing.inStock === true
+            ? 'listed in stock'
+            : d.listing.inStock === false
+              ? 'listed out of stock'
+              : 'unverified'
+        }`
     )
     .join('\n');
 
@@ -239,7 +345,7 @@ export async function writeVerdict(
     signal,
   });
 
-  return answer ?? fallback;
+  return answer && verdictIsGrounded(answer, deals) ? answer : fallback;
 }
 
-export const __testing = { ruleVerdict };
+export const __testing = { ruleVerdict, mergeEnrichment, verdictIsGrounded };

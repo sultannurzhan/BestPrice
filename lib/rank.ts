@@ -63,20 +63,32 @@ function bestListingForDomain(
   listings: Listing[],
   query: ProductQuery
 ): { listing: Listing; confidence: number } | null {
-  let best: { listing: Listing; confidence: number } | null = null;
+  const matched: Array<{ listing: Listing; confidence: number }> = [];
 
   for (const listing of listings) {
     const match = matchListing(listing, query);
     if (match.rejected || match.confidence < MIN_CONFIDENCE) continue;
 
+    matched.push({ listing, confidence: match.confidence });
+  }
+
+  // Never discard a purchasable listing in favour of a cheaper row the same
+  // retailer explicitly marks out of stock. Keep out-of-stock rows only when
+  // that shop has no credible alternative at all.
+  const pool = matched.some(({ listing }) => listing.inStock !== false)
+    ? matched.filter(({ listing }) => listing.inStock !== false)
+    : matched;
+  let best: { listing: Listing; confidence: number } | null = null;
+
+  for (const candidate of pool) {
     if (
       !best ||
       // Prefer clearly better matches; among comparable matches prefer cheaper.
-      match.confidence > best.confidence + 0.15 ||
-      (Math.abs(match.confidence - best.confidence) <= 0.15 &&
-        listing.price < best.listing.price)
+      candidate.confidence > best.confidence + 0.15 ||
+      (Math.abs(candidate.confidence - best.confidence) <= 0.15 &&
+        candidate.listing.price < best.listing.price)
     ) {
-      best = { listing, confidence: match.confidence };
+      best = candidate;
     }
   }
 
@@ -191,7 +203,15 @@ export function rankDeals({ results, storesByDomain, query }: RankInput): RankOu
     };
   });
 
-  deals.sort((a, b) => a.score - b.score);
+  const hasPurchasableDeal = deals.some((deal) => deal.listing.inStock !== false);
+  deals.sort((a, b) => {
+    if (hasPurchasableDeal) {
+      const availabilityDelta =
+        Number(a.listing.inStock === false) - Number(b.listing.inStock === false);
+      if (availabilityDelta !== 0) return availabilityDelta;
+    }
+    return a.score - b.score;
+  });
 
   return { deals, listingsSeen, listingsMatched };
 }

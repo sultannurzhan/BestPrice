@@ -1,6 +1,8 @@
 import { cacheGet, cacheSet, TTL } from '../cache';
 import { diskGet, diskSet } from '../diskCache';
 import { politeFetch } from '../fetcher';
+import { elementBlocks, stripHtmlTags } from '../html';
+import { normaliseProductText } from '../product';
 
 /**
  * Work out how to search an arbitrary shop's website.
@@ -49,6 +51,17 @@ export interface SearchEndpoint {
   template: string;
 }
 
+function isSearchEndpoint(value: unknown): value is SearchEndpoint {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const template = (value as Record<string, unknown>).template;
+  return (
+    typeof template === 'string' &&
+    template.startsWith('/') &&
+    template.includes('{q}') &&
+    template.length <= 2_048
+  );
+}
+
 export class BlockedError extends Error {
   constructor(public domain: string) {
     super(`${domain} refused automated requests`);
@@ -78,7 +91,9 @@ export function searchUrlFor(
 
 function countPrices(html: string): number {
   return (
-    html.match(/\d[\d    .,]{2,14}(?:<[^>]*>|\s|&nbsp;)*(?:₸|〒|тг\b|тенге)/gi)
+    html.match(
+      /\d[\d    .,]{2,14}(?:<[^>]{0,200}>|\s|&nbsp;)*(?:₸|〒|тг(?![\p{L}\p{N}])|тенге)/giu
+    )
       ?.length ?? 0
   );
 }
@@ -87,18 +102,64 @@ function countPrices(html: string): number {
  * How many product links mention the search term? This is what separates real
  * results from a homepage carousel.
  */
-function countRelevantTitles(html: string, terms: string[]): number {
+function countRelevantTitles(html: string, terms: string[], origin: string): number {
   if (terms.length === 0) return Infinity;
+  const normalisedTerms = terms.map((term) =>
+    normaliseProductText(term).toLowerCase()
+  );
+  const identifiers = normalisedTerms.filter((term) => /\d/.test(term));
+  const variants = new Set([
+    'pro', 'max', 'ultra', 'plus', 'mini', 'air', 'fe', 'lite', 'slim',
+    'oled', 'fold', 'flip', 'se',
+  ]);
+  const familyTerms = normalisedTerms.filter(
+    (term) => !/\d/.test(term) && !variants.has(term)
+  );
+  const normaliseHost = (host: string) => host.toLowerCase().replace(/^www\./, '');
+  let expectedHost: string;
+  try {
+    expectedHost = normaliseHost(new URL(origin).hostname);
+  } catch {
+    return 0;
+  }
 
   let hits = 0;
-  for (const m of html.matchAll(/<a\b[^>]*>([\s\S]{0,300}?)<\/a>/gi)) {
-    const text = m[1]
-      .replace(/<[^>]*>/g, ' ')
+  for (const block of elementBlocks(html, 'a')) {
+    if (block.content.length > 300) continue;
+    const href = block.attributes.match(/href=["']([^"']+)["']/i)?.[1];
+    if (!href || /(?:^#|javascript:|\/(?:blog|news|article|help|about|search|tag)(?:\/|$))/i.test(href)) {
+      continue;
+    }
+    let url: URL;
+    try {
+      url = new URL(href, origin);
+    } catch {
+      continue;
+    }
+    if (
+      !['http:', 'https:'].includes(url.protocol) ||
+      normaliseHost(url.hostname) !== expectedHost
+    ) {
+      continue;
+    }
+    const path = url.pathname;
+    const lastSegment = path.split('/').filter(Boolean).pop() ?? '';
+    const productishHref =
+      /\/(?:product|products|p|tovar|tovary|item|goods)\//i.test(path) ||
+      /\d/.test(lastSegment) ||
+      /[a-z0-9]+(?:-[a-z0-9]+){2,}/i.test(lastSegment);
+    if (!productishHref) continue;
+    const text = stripHtmlTags(block.content)
       .replace(/\s+/g, ' ')
       .trim();
-    if (text.length < 10) continue;
-    const lower = text.toLowerCase();
-    if (terms.some((t) => lower.includes(t))) hits++;
+    if (text.length < 3) continue;
+    const lower = normaliseProductText(text).toLowerCase();
+    const compact = lower.replace(/[^\p{L}\p{N}]+/gu, '');
+    const hasTerm = (term: string) =>
+      lower.includes(term) || compact.includes(term.replace(/[^\p{L}\p{N}]+/gu, ''));
+    const hasIdentifiers = identifiers.every(hasTerm);
+    const hasFamily = familyTerms.length === 0 || familyTerms.some(hasTerm);
+    if (hasIdentifiers && hasFamily) hits++;
     if (hits >= 2) return hits;
   }
   return hits;
@@ -125,21 +186,35 @@ function judge(
     return { accepted: false, clientRendered: false };
   }
 
+  const normaliseHost = (host: string) => host.toLowerCase().replace(/^www\./, '');
+  if (normaliseHost(landed.hostname) !== normaliseHost(requested.hostname)) {
+    return { accepted: false, clientRendered: false };
+  }
+
   // Bounced to the homepage: whatever prices are here belong to a carousel.
   if (landed.pathname === '/' && requested.pathname !== '/' && !landed.search) {
     return { accepted: false, clientRendered: false };
   }
 
   const prices = countPrices(html);
-  const relevant = countRelevantTitles(html, terms);
+  const relevant = countRelevantTitles(html, terms, landed.origin);
 
   if (prices >= 3 && relevant >= 2) return { accepted: true, clientRendered: false };
 
   // Search chrome present (filters, a results heading) but nothing priced:
   // the products are almost certainly fetched by JavaScript.
-  const hasSearchChrome =
-    /class=["'][^"']*(?:filter|facet|catalog|product-list|search-result)/i.test(html) ||
-    /найдено|результат поиска|search results/i.test(html);
+  const lower = html.toLowerCase();
+  const hasSearchChrome = [
+    'class="filter',
+    "class='filter",
+    'class="facet',
+    "class='facet",
+    'product-list',
+    'search-result',
+    'найдено',
+    'результат поиска',
+    'search results',
+  ].some((marker) => lower.includes(marker));
 
   if (hasSearchChrome && prices < 3) {
     return { accepted: false, clientRendered: true };
@@ -165,12 +240,10 @@ function discoverFromForms(html: string, origin: string): string[] {
     }
   }
 
-  const formRe = /<form\b([^>]*)>([\s\S]{0,6000}?)<\/form>/gi;
-  let m: RegExpExecArray | null;
-
-  while ((m = formRe.exec(html))) {
-    const attrs = m[1];
-    const inner = m[2];
+  for (const block of elementBlocks(html, 'form')) {
+    if (block.attributes.length > 2_000 || block.content.length > 6_000) continue;
+    const attrs = block.attributes;
+    const inner = block.content;
 
     const method = (attrs.match(/method=["']([^"']*)["']/i)?.[1] ?? 'get').toLowerCase();
     if (method !== 'get') continue;
@@ -216,8 +289,10 @@ function discoverFromForms(html: string, origin: string): string[] {
 export async function discoverSearchEndpoint(
   domain: string,
   probeQuery: string,
-  terms: string[]
+  terms: string[],
+  signal?: AbortSignal
 ): Promise<SearchEndpoint | null> {
+  signal?.throwIfAborted();
   const cacheKey = `endpoint:${domain}`;
 
   const cachedValue = cacheGet<SearchEndpoint | null>(cacheKey);
@@ -229,14 +304,17 @@ export async function discoverSearchEndpoint(
    * URL almost never changes, so the answer is persisted; a negative answer is
    * kept for a shorter time in case a shop adds search later.
    */
-  const remembered = await diskGet<SearchEndpoint | null>(
+  const remembered = await diskGet<unknown>(
     cacheKey,
     DISK_TTL_POSITIVE
   );
   if (remembered) {
     const value = remembered.value;
     // Honour the shorter negative TTL.
-    if (value !== null || remembered.ageMs <= DISK_TTL_NEGATIVE) {
+    if (
+      (isSearchEndpoint(value) || value === null) &&
+      (value !== null || remembered.ageMs <= DISK_TTL_NEGATIVE)
+    ) {
       cacheSet(cacheKey, value, value ? TTL.endpoint : TTL.blocked);
       return value;
     }
@@ -252,8 +330,9 @@ export async function discoverSearchEndpoint(
   const DEAD_PROBE_LIMIT = 2;
 
   const attempt = async (template: string): Promise<SearchEndpoint | null> => {
+    signal?.throwIfAborted();
     const url = buildUrl(origin, template, probeQuery);
-    const res = await politeFetch(url, { timeoutMs: PROBE_TIMEOUT_MS });
+    const res = await politeFetch(url, { timeoutMs: PROBE_TIMEOUT_MS, signal });
 
     if (res.failure === 'blocked') throw new BlockedError(domain);
     if (res.failure === 'timeout' || res.failure === 'unreachable') deadProbes++;
@@ -266,10 +345,12 @@ export async function discoverSearchEndpoint(
 
   const tryAll = async (templates: string[]): Promise<SearchEndpoint | null> => {
     for (let i = 0; i < templates.length; i += PROBE_BATCH) {
+      signal?.throwIfAborted();
       if (deadProbes >= DEAD_PROBE_LIMIT) return null;
 
       const batch = templates.slice(i, i + PROBE_BATCH);
       const found = await Promise.all(batch.map((t) => attempt(t).catch((e) => e)));
+      signal?.throwIfAborted();
 
       for (const r of found) {
         if (r instanceof BlockedError) throw r;
@@ -295,7 +376,7 @@ export async function discoverSearchEndpoint(
     }
 
     // Nothing conventional worked — ask the site how it searches.
-    const home = await politeFetch(origin, { timeoutMs: PROBE_TIMEOUT_MS });
+    const home = await politeFetch(origin, { timeoutMs: PROBE_TIMEOUT_MS, signal });
     if (home.failure === 'blocked') throw new BlockedError(domain);
 
     if (home.ok) {
@@ -309,6 +390,7 @@ export async function discoverSearchEndpoint(
       }
     }
   } catch (err) {
+    signal?.throwIfAborted();
     if (err instanceof BlockedError) {
       // Blocking is a property of the site, not of this query — but do not
       // persist it, since bot rules change and a 403 may be rate limiting.
@@ -317,9 +399,16 @@ export async function discoverSearchEndpoint(
     }
   }
 
+  signal?.throwIfAborted();
   await remember(null);
   if (sawClientRendered) throw new ClientRenderedError(domain);
   return null;
 }
 
-export const __testing = { discoverFromForms, judge, countRelevantTitles, URL_PATTERNS };
+export const __testing = {
+  discoverFromForms,
+  judge,
+  countRelevantTitles,
+  isSearchEndpoint,
+  URL_PATTERNS,
+};
