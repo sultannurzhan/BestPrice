@@ -11,3 +11,6 @@ npm-debug.log*
 next-env.d.ts
 tsconfig.tsbuildinfo
 .cache/
+
+.vercel
+.env*

@@ -85,6 +85,73 @@ test('reports a clear error when Overpass is down and nothing is cached', async 
   }
 });
 
+test('treats an Overpass "remark" timeout as failure, not as zero shops', async () => {
+  // Overpass reports its own timeouts with HTTP 200, an empty elements array
+  // and a remark. Taken at face value the deployed app told users there were
+  // no shops in central Almaty. Every mirror here returns that shape, so the
+  // lookup must fail rather than succeed with nothing.
+  const lat = 12.555;
+  const lon = 22.666;
+  const radius = 3333;
+
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response(
+      JSON.stringify({
+        version: 0.6,
+        remark: 'runtime error: Query timed out in "query" at line 3 after 25 seconds.',
+        elements: [],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      () => findStores({ lat, lon }, radius),
+      (err: unknown) => err instanceof OverpassUnavailableError
+    );
+    assert.ok(calls > 1, `should have tried more than one mirror, tried ${calls}`);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('an empty store result is not cached', async () => {
+  // A genuinely empty area must not be remembered as empty, or a transient
+  // upstream failure sticks for the rest of the day.
+  const lat = 13.777;
+  const lon = 23.888;
+  const radius = 2222;
+
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response(JSON.stringify({ version: 0.6, elements: [] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    const first = await findStores({ lat, lon }, radius);
+    assert.equal(first.stores.length, 0);
+
+    const callsAfterFirst = calls;
+    await findStores({ lat, lon }, radius);
+    assert.ok(
+      calls > callsAfterFirst,
+      'second lookup should hit the network again, not serve a cached empty list'
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    await rm(__testing.pathFor(storeKey(lat, lon, radius)), { force: true }).catch(
+      () => {}
+    );
+  }
+});
+
 test('disk cache round-trips and respects max age', async () => {
   const key = 'test:roundtrip';
   try {

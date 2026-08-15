@@ -37,6 +37,11 @@ export function cacheSet<T>(key: string, value: T, ttlMs: number): void {
   store.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
+/** Drop a key so the next caller recomputes it. */
+export function cacheDelete(key: string): void {
+  store.delete(key);
+}
+
 /** Run `fn` unless a fresh cached value exists. Concurrent callers share one flight. */
 const inFlight = new Map<string, Promise<unknown>>();
 

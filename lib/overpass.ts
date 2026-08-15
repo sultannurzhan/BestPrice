@@ -1,4 +1,4 @@
-import { cached, TTL } from './cache';
+import { cacheDelete, cached, TTL } from './cache';
 import { diskGet, diskGetStale, diskSet } from './diskCache';
 import { haversine } from './geo';
 import type { Coords, Store } from './types';
@@ -75,7 +75,22 @@ async function askMirror(url: string, query: string): Promise<OverpassElement[]>
     throw err;
   }
 
-  const json = (await res.json()) as { elements?: OverpassElement[] };
+  const json = (await res.json()) as {
+    elements?: OverpassElement[];
+    remark?: string;
+  };
+
+  /**
+   * Overpass reports its own failures with HTTP 200: a server-side timeout or
+   * out-of-memory comes back as an empty `elements` array plus a `remark`.
+   * Taken at face value that reads as "there are no shops here", which is how
+   * the deployed app confidently reported zero stores in central Almaty.
+   * Treat it as a failure so we fail over to another mirror.
+   */
+  if (json.remark && /error|timed? ?out|memory/i.test(json.remark)) {
+    throw new Error(`remark: ${json.remark.slice(0, 80)}`);
+  }
+
   return json.elements ?? [];
 }
 
@@ -95,8 +110,19 @@ export class OverpassUnavailableError extends Error {
  */
 async function runOverpass(query: string): Promise<OverpassElement[]> {
   const attempts: string[] = [];
+  /**
+   * Leave room for the actual price scraping. Serverless hosts cap the whole
+   * request (60s on Vercel Hobby), and burning it all on mirrors that are
+   * timing out means the user waits a minute to be told nothing was found.
+   */
+  const deadline = Date.now() + 32_000;
 
   for (const url of MIRRORS) {
+    if (Date.now() > deadline) {
+      attempts.push('deadline reached');
+      break;
+    }
+
     const host = new URL(url).host;
 
     for (let tryNo = 0; tryNo < 2; tryNo++) {
@@ -221,9 +247,17 @@ export async function findStores(
           .sort((a, b) => a.distanceM - b.distanceM)
       );
 
-      await diskSet(key, found);
+      // Never persist an empty result. A transient Overpass failure that slips
+      // through would otherwise poison the cache with "no shops here" for a
+      // full day, and the disk copy would keep serving it after that.
+      if (found.length > 0) await diskSet(key, found);
       return found;
     });
+
+    // Same reasoning as the disk cache: an empty answer is far more likely to
+    // be a bad day at Overpass than a genuinely shopless neighbourhood, so let
+    // the next request try again rather than holding it for a day.
+    if (stores.length === 0) cacheDelete(key);
 
     return { stores, staleAgeMs: null };
   } catch (err) {

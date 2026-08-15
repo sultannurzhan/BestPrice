@@ -108,7 +108,15 @@ export async function scrapeDomain(
       return empty('unreachable');
     }
 
-    const res = await politeFetch(searchUrl, { timeoutMs: 12_000 });
+    /**
+     * Known retailers get longer, because the ones worth waiting for are the
+     * slow ones: fmobile.kz returns a 3.8 MB page and timed out at 12 s when the
+     * deployed function ran in US-East. Unknown shops stay on a short leash so
+     * the long tail cannot eat the request budget.
+     */
+    const res = await politeFetch(searchUrl, {
+      timeoutMs: adapter?.searchTemplate ? 22_000 : 12_000,
+    });
     if (!res.ok) return empty(res.failure ?? 'unreachable', searchUrl);
 
     const baseUrl = res.finalUrl || searchUrl;
