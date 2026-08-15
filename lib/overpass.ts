@@ -61,7 +61,12 @@ async function askMirror(url: string, query: string): Promise<OverpassElement[]>
       'User-Agent': 'BestPrice/0.1 (local price comparison tool)',
     },
     body: 'data=' + encodeURIComponent(query),
-    signal: AbortSignal.timeout(40_000),
+    /**
+     * Deliberately short. A healthy mirror answers this query in ~15 s, so
+     * waiting 40 s only delays failing over to one that works — and on a
+     * serverless host the whole request has a hard 60 s ceiling to fit inside.
+     */
+    signal: AbortSignal.timeout(18_000),
   });
 
   if (!res.ok) {

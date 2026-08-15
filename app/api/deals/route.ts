@@ -35,6 +35,15 @@ const SCRAPE_CONCURRENCY = 6;
 const MAX_DOMAINS = 16;
 
 /**
+ * Shops with no adapter need endpoint discovery, which is the slowest thing we
+ * do — several candidate URLs against a host that may not answer at all. Known
+ * retailers are unaffected; this only bounds the unknown tail so a search fits
+ * inside a serverless request limit. Whatever is dropped is reported, never
+ * silently skipped.
+ */
+const MAX_UNKNOWN_DOMAINS = 6;
+
+/**
  * Reasons a retailer produced nothing, phrased for a shopper rather than a
  * developer. Only genuine coverage gaps appear in the UI; "nothing found" is a
  * real answer, not a gap.
@@ -156,9 +165,9 @@ export async function POST(request: Request): Promise<Response> {
         // Order matters: retailers we know how to read go first so useful
         // results stream in early, then the chains with the most branches,
         // then whatever is closest.
-        const domains = [...byDomain.entries()]
+        const ranked = [...byDomain.entries()]
           .sort((a, b) => {
-            const known = (d: string) => (adapterFor(d)?.searchTemplate ? 0 : 1);
+            const known = (d: string) => (adapterFor(d) ? 0 : 1);
             const knownDelta = known(a[0]) - known(b[0]);
             if (knownDelta !== 0) return knownDelta;
 
@@ -167,8 +176,18 @@ export async function POST(request: Request): Promise<Response> {
 
             return a[1][0].distanceM - b[1][0].distanceM;
           })
-          .slice(0, MAX_DOMAINS)
           .map(([domain]) => domain);
+
+        // Keep every retailer we already know how to handle, plus the nearest
+        // handful of unknown ones. The rest are reported as skipped.
+        const known = ranked.filter((d) => adapterFor(d));
+        const unknown = ranked.filter((d) => !adapterFor(d));
+        const skipped = unknown.slice(MAX_UNKNOWN_DOMAINS);
+
+        const domains = [...known, ...unknown.slice(0, MAX_UNKNOWN_DOMAINS)].slice(
+          0,
+          MAX_DOMAINS
+        );
 
         send({ type: 'stores', count: stores.length, domains: domains.length });
 
@@ -242,7 +261,13 @@ export async function POST(request: Request): Promise<Response> {
             listingsSeen,
             listingsMatched,
             dealsFound: deals.length,
-            gaps: toGaps(results),
+            gaps: [
+              ...toGaps(results),
+              ...skipped.map((domain) => ({
+                label: labelFor(domain),
+                reason: 'skipped to keep the search within its time budget',
+              })),
+            ],
             verdict,
             tookMs: Date.now() - started,
           },
