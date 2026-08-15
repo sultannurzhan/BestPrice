@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useRef, useState } from 'react';
 import type { Coords } from '@/lib/types';
 
 /** Fallbacks for when the browser denies geolocation. */
@@ -9,6 +9,18 @@ const CITIES: Array<{ name: string; coords: Coords }> = [
   { name: 'Astana', coords: { lat: 51.1282, lon: 71.4304 } },
   { name: 'Shymkent', coords: { lat: 42.3417, lon: 69.5901 } },
   { name: 'Karaganda', coords: { lat: 49.8047, lon: 73.1094 } },
+  { name: 'Aktobe', coords: { lat: 50.2839, lon: 57.166 } },
+  { name: 'Taraz', coords: { lat: 42.9, lon: 71.3667 } },
+  { name: 'Pavlodar', coords: { lat: 52.2873, lon: 76.9674 } },
+  { name: 'Oskemen', coords: { lat: 49.9483, lon: 82.6283 } },
+  { name: 'Semey', coords: { lat: 50.4111, lon: 80.2275 } },
+  { name: 'Atyrau', coords: { lat: 47.1167, lon: 51.8833 } },
+  { name: 'Kostanay', coords: { lat: 53.2144, lon: 63.6246 } },
+  { name: 'Kyzylorda', coords: { lat: 44.8488, lon: 65.4823 } },
+  { name: 'Oral', coords: { lat: 51.2333, lon: 51.3667 } },
+  { name: 'Petropavl', coords: { lat: 54.8667, lon: 69.15 } },
+  { name: 'Aktau', coords: { lat: 43.6532, lon: 51.1975 } },
+  { name: 'Turkistan', coords: { lat: 43.2973, lon: 68.2518 } },
 ];
 
 /** Radius stops, in metres. A slider over these reads better than free km. */
@@ -28,18 +40,15 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
   const [cityName, setCityName] = useState<string | null>(null);
   const [locating, setLocating] = useState(false);
   const [locationError, setLocationError] = useState<string | null>(null);
+  const locationRequestRef = useRef(0);
 
   const [radiusIndex, setRadiusIndex] = useState(4); // 5 km
   const [item, setItem] = useState('');
 
   const radiusM = RADIUS_STOPS[radiusIndex];
 
-  // Ask for location on first paint — it is the one thing the app cannot guess.
-  useEffect(() => {
-    requestLocation();
-  }, []);
-
   function requestLocation() {
+    const requestId = ++locationRequestRef.current;
     if (typeof navigator === 'undefined' || !navigator.geolocation) {
       setLocationError('This browser has no geolocation support.');
       return;
@@ -50,12 +59,14 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
 
     navigator.geolocation.getCurrentPosition(
       (pos) => {
+        if (locationRequestRef.current !== requestId) return;
         setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude });
         setSource('gps');
         setCityName(null);
         setLocating(false);
       },
       (err) => {
+        if (locationRequestRef.current !== requestId) return;
         setLocating(false);
         setLocationError(
           err.code === err.PERMISSION_DENIED
@@ -68,6 +79,10 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
   }
 
   function pickCity(city: (typeof CITIES)[number]) {
+    // Geolocation cannot be cancelled in browsers. Invalidate its callbacks so
+    // a late GPS result cannot silently overwrite the city the user picked.
+    locationRequestRef.current++;
+    setLocating(false);
     setCoords(city.coords);
     setSource('city');
     setCityName(city.name);
@@ -127,12 +142,13 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
           onChange={(e) => setRadiusIndex(Number(e.target.value))}
           disabled={running}
           aria-label="Search radius"
+          aria-valuetext={radiusM < 1000 ? `${radiusM} metres` : `${radiusM / 1000} kilometres`}
         />
       </div>
 
       {/* ---- location -------------------------------------------------- */}
-      <div className="mb-6">
-        <span className="field-label">Your location</span>
+      <fieldset className="mb-6 min-w-0 border-0 p-0">
+        <legend className="field-label">Your location</legend>
 
         {coords && (
           <p className="text-sm mb-3" style={{ color: 'var(--muted)' }}>
@@ -150,7 +166,12 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
         )}
 
         {locationError && (
-          <p className="text-sm mb-3" style={{ color: 'var(--warn)' }}>
+          <p
+            className="text-sm mb-3"
+            style={{ color: 'var(--warn)' }}
+            role="status"
+            aria-live="polite"
+          >
             {locationError}
           </p>
         )}
@@ -166,7 +187,7 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
             {locating ? 'Locating…' : 'Use my location'}
           </button>
 
-          {CITIES.map((city) => (
+          {CITIES.slice(0, 4).map((city) => (
             <button
               key={city.name}
               type="button"
@@ -178,8 +199,34 @@ export function SearchForm({ onSearch, onCancel, running }: Props) {
               {city.name}
             </button>
           ))}
+
+          <label htmlFor="fallback-city" className="sr-only">
+            Choose another city
+          </label>
+          <select
+            id="fallback-city"
+            className="text-input city-select"
+            value={
+              source === 'city' && CITIES.slice(4).some((city) => city.name === cityName)
+                ? cityName ?? ''
+                : ''
+            }
+            onChange={(event) => {
+              const city = CITIES.find((candidate) => candidate.name === event.target.value);
+              if (city) pickCity(city);
+            }}
+            disabled={running}
+            aria-label="Choose another city"
+          >
+            <option value="">More cities…</option>
+            {CITIES.slice(4).map((city) => (
+              <option key={city.name} value={city.name}>
+                {city.name}
+              </option>
+            ))}
+          </select>
         </div>
-      </div>
+      </fieldset>
 
       {/* ---- submit ---------------------------------------------------- */}
       <div className="flex items-center gap-3">

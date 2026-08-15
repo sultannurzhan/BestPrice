@@ -50,10 +50,36 @@ const IDLE: AgentState = {
   error: null,
 };
 
+function finishPendingProgress(
+  progress: DomainProgress[],
+  failure: ScrapeFailure = 'unreachable'
+): DomainProgress[] {
+  return progress.map((entry) =>
+    entry.state === 'start'
+      ? { domain: entry.domain, state: 'done', found: 0, failure }
+      : entry
+  );
+}
+
+function failedState(
+  state: AgentState,
+  error: string,
+  failure: ScrapeFailure = 'unreachable'
+): AgentState {
+  return {
+    ...state,
+    running: false,
+    status: null,
+    progress: finishPendingProgress(state.progress, failure),
+    error,
+  };
+}
+
 export function useAgentSearch() {
   const [state, setState] = useState<AgentState>(IDLE);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
+  const lastRequestRef = useRef<SearchRequest | null>(null);
 
   useEffect(
     () => () => {
@@ -67,10 +93,11 @@ export function useAgentSearch() {
     requestIdRef.current++;
     abortRef.current?.abort();
     abortRef.current = null;
-    setState((s) => ({ ...s, running: false, status: null }));
+    setState((s) => ({ ...s, running: false, status: 'Search stopped' }));
   }, []);
 
   const run = useCallback(async (request: SearchRequest) => {
+    lastRequestRef.current = request;
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -93,17 +120,15 @@ export function useAgentSearch() {
       if (!res.ok) {
         const problem = await res.json().catch(() => ({ error: res.statusText }));
         terminalEvent = true;
-        update((s) => ({
-          ...s,
-          running: false,
-          error: problem.error ?? `Request failed (${res.status})`,
-        }));
+        update((s) =>
+          failedState(s, problem.error ?? `Request failed (${res.status})`)
+        );
         return;
       }
 
       if (!res.body) {
         terminalEvent = true;
-        update((s) => ({ ...s, running: false, error: 'No response stream' }));
+        update((s) => failedState(s, 'No response stream'));
         return;
       }
 
@@ -120,7 +145,7 @@ export function useAgentSearch() {
         // Accept both LF and CRLF separators; proxies are allowed to normalize
         // line endings even though our own route emits LF.
         for (;;) {
-          const separator = buffer.match(/\r?\n\r?\n/);
+          const separator = buffer.match(/(?:\r\n|\r|\n){2}/);
           if (separator?.index === undefined) break;
           const record = buffer.slice(0, separator.index);
           buffer = buffer.slice(separator.index + separator[0].length);
@@ -145,24 +170,23 @@ export function useAgentSearch() {
       }
 
       if (!terminalEvent) {
-        update((s) => ({
-          ...s,
-          running: false,
-          status: null,
-          error: 'The search ended before results arrived. Please try again.',
-        }));
+        update((s) =>
+          failedState(s, 'The search ended before results arrived. Please try again.')
+        );
       }
     } catch (err) {
       if (controller.signal.aborted) return;
-      update((s) => ({
-        ...s,
-        running: false,
-        error: err instanceof Error ? err.message : 'Search failed',
-      }));
+      update((s) =>
+        failedState(s, err instanceof Error ? err.message : 'Search failed')
+      );
     } finally {
       if (requestIdRef.current === requestId) abortRef.current = null;
     }
   }, []);
+
+  const retry = useCallback(() => {
+    if (lastRequestRef.current) void run(lastRequestRef.current);
+  }, [run]);
 
   const reset = useCallback(() => {
     requestIdRef.current++;
@@ -171,14 +195,30 @@ export function useAgentSearch() {
     setState(IDLE);
   }, []);
 
-  return { state, run, cancel, reset };
+  return {
+    state,
+    run,
+    cancel,
+    retry,
+    canRetry: lastRequestRef.current !== null && !state.running,
+    reset,
+  };
 }
 
 function parseSseRecord(record: string): AgentEvent | null {
-  const line = record.split(/\r?\n/).find((candidate) => candidate.startsWith('data: '));
-  if (!line) return null;
+  const data: string[] = [];
+  for (const line of record.split(/\r\n|\r|\n/)) {
+    if (!line || line.startsWith(':')) continue;
+    const colon = line.indexOf(':');
+    const field = colon === -1 ? line : line.slice(0, colon);
+    if (field !== 'data') continue;
+    let value = colon === -1 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    data.push(value);
+  }
+  if (data.length === 0) return null;
   try {
-    return JSON.parse(line.slice(6)) as AgentEvent;
+    return JSON.parse(data.join('\n')) as AgentEvent;
   } catch {
     return null;
   }
@@ -223,7 +263,11 @@ function reduce(prev: AgentState, event: AgentEvent): AgentState {
       };
 
     case 'error':
-      return { ...prev, error: event.message, running: false, status: null };
+      return failedState(
+        prev,
+        event.message,
+        /time limit|timed out/i.test(event.message) ? 'timeout' : 'unreachable'
+      );
 
     default:
       return prev;

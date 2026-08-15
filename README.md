@@ -10,7 +10,9 @@ npm install
 npm run dev
 ```
 
-Then open <http://localhost:3000>. No API keys required.
+Then open <http://localhost:3000>. Node.js 22 or newer is required. No API keys
+are required. Location permission is requested only after you select **Use my
+location**; the built-in city choices work without it.
 
 ---
 
@@ -58,10 +60,11 @@ Three things that matter in practice, all learned the hard way:
   under load constantly. We try six mirrors, retrying transient statuses once.
 - **No regex tag filters.** `["shop"~"^(a|b|c)$"]` bypasses Overpass's tag index
   and times out; separate exact-match clauses return in ~15 s.
-- **Disk-backed store cache** (`.cache/`). During development *every* mirror
+- **Bounded disk-backed store cache** (`.cache/`). During development *every* mirror
   failed simultaneously, which took the whole app down. Shop locations barely
-  change, so they are persisted indefinitely and served stale (with a notice)
-  when Overpass is unreachable. Prices are never served stale from disk.
+  change, so they are served stale (with a notice) when Overpass is unreachable.
+  Atomic writes plus fixed entry, byte, file-size and age ceilings prevent cache
+  corruption or unbounded disk growth. Prices are never served stale from disk.
 
 ### 2. Chain grouping — the main efficiency win
 
@@ -79,6 +82,11 @@ trustworthiness and takes the first that yields usable rows:
 2. **Microdata** — `itemprop="price"`.
 3. **Embedded JSON** — `__NEXT_DATA__`, Nuxt payloads, Bitrix blobs.
 4. **Proximity** — pair each visible price with its most product-like nearby link.
+
+Every strategy is bounded by response, traversal, title and listing limits.
+Structured prices honour their declared currency, mixed-currency offer arrays
+prefer KZT, monthly installment figures are excluded, and exposed product links
+must stay on the retailer's own HTTP(S) origin.
 
 Strategy 4 is the workhorse for the long tail. It scans **both directions** from
 each price (some templates put the title above, some below) and scores candidate
@@ -109,12 +117,18 @@ it returns a phone. Rank on sticker price alone and the best deal is always a
 | Condition keywords | `iPhone 15 (б/у)`, `копия 1:1` |
 | Category price floor | an "iPhone" at 3 990 ₸ is a case |
 | **Model identifier** | `Samsung Galaxy A17` must not match `Galaxy Buds` |
+| Required variant | `iPhone 15 Pro` must not match a plain `iPhone 15` |
+| Brand conflict | a Samsung query cannot accept an explicitly Xiaomi listing |
 | Storage mismatch | asked 256 GB, listing is 128 GB |
+| RAM mismatch | asked 16 GB RAM, listing is 8 GB |
 | Token coverage < 66 % | title is about something else |
 
 The model-identifier rule is the important one: any query token containing a
 digit (`15`, `a17`, `s24`, `m3`) is treated as **mandatory**, not merely counted.
-Matched whole-word, so `a5` never matches `a55`.
+Exact token signatures also tolerate harmless retailer formatting such as
+`Fold5`/`Fold 5` and `WH-1000XM5`/`WH1000XM5`, while `a5` still never matches
+`a55`. Russian product aliases and Cyrillic model lookalikes are normalised, and
+model/storage notation such as `iPhone 12/128` is kept distinct from RAM/storage.
 
 > **A note for anyone extending this:** JavaScript's `\b` is defined against
 > `[A-Za-z0-9_]`, so `/\b(чехол)\b/` **never matches a Cyrillic title**. Every
@@ -133,9 +147,32 @@ total = price
       + round-trip time     (at 22 km/h city average + 6 min parking, × 1 200 ₸/h)
 ```
 
-Then a soft penalty for low match confidence and for listings marked out of
-stock. Constants are at the top of `lib/rank.ts` — tune them to your own view of
-what an hour is worth.
+Then a soft penalty is applied for low match confidence. An explicitly
+out-of-stock listing is always placed after any credible purchasable or
+unknown-stock option. Constants are at the top of `lib/rank.ts` — tune them to
+your own view of what an hour is worth.
+
+### 6. Safety, limits and cancellation
+
+Retailer URLs are untrusted OpenStreetMap data. Before every request and
+redirect, `lib/fetcher.ts` rejects credentials, non-standard ports, local
+hostnames, and private or reserved IPv4/IPv6 ranges. It then connects to the
+already validated address while preserving the original Host header and TLS
+identity, closing the DNS rebinding gap. Responses, decompression, redirects,
+DNS, per-host concurrency, global outbound concurrency and deadlines are all
+bounded. The in-memory TTL cache has both entry-count and byte ceilings; a
+single large result cannot consume its full budget.
+
+The public search route additionally enforces a 4 KiB JSON body limit (including
+a slow-body deadline), same-origin browser requests, bounded process-local rate
+and concurrency limits, and a 52-second global work budget. Proxy-derived client
+addresses are trusted only on recognized platforms; self-hosters can opt in with
+`BESTPRICE_TRUST_PROXY=1` after configuring their reverse proxy to strip forged
+forwarding headers. Cancelling the browser stream propagates to store discovery
+and retailer requests. If the global deadline arrives after some retailers
+finish, the completed results are ranked instead of discarded. Unexpected
+failures receive a request reference without exposing internal error details to
+the browser.
 
 ---
 
@@ -145,7 +182,8 @@ This is the part most price-comparison demos hide. Free scraping cannot read
 every shop, so the UI states which ones it could not read **and why**, rather
 than implying they had no stock.
 
-Measured against live sites in central Almaty:
+Observed against live sites in central Almaty during initial development (sites
+change frequently):
 
 | Retailer | Status |
 |---|---|
@@ -194,7 +232,9 @@ lib/
   rank.ts               true-cost model
   fetcher.ts            polite HTTP: per-host limits, timeouts, block detection
   cache.ts              in-memory TTL cache with single-flight
-  diskCache.ts          persistent store cache, survives Overpass outages
+  diskCache.ts          bounded persistent store cache, survives Overpass outages
+  html.ts               linear-time scanner for untrusted retailer markup
+  searchGuard.ts        request body, origin, rate and concurrency controls
   llm.ts                optional OpenRouter (query parsing + verdict)
   scrape/
     discover.ts         find a working, *relevant* search URL
@@ -202,9 +242,7 @@ lib/
     adapters.ts         per-retailer knowledge, verified against live sites
 scripts/
   probe.ts              diagnostic: what did we read, what was rejected, why
-  match.test.ts         query parsing, filtering, cost model
-  extract.test.ts       HTML extraction, using real retailer markup
-  resilience.test.ts    behaviour when Overpass is down
+  *.test.ts             matcher, extraction, security, streaming and resilience
 ```
 
 ## Commands

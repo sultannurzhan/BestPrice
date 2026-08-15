@@ -39,7 +39,6 @@ export function AgentProgress({
   return (
     <div
       className="card p-4 sm:p-5 fade-up"
-      aria-live="polite"
       aria-busy={running}
     >
       {/* headline status */}
@@ -51,7 +50,7 @@ export function AgentProgress({
             aria-hidden
           />
         )}
-        <p className="text-sm font-medium">
+        <p className="text-sm font-medium" aria-live="polite" aria-atomic="true">
           {status ?? (running ? 'Working…' : 'Done')}
         </p>
       </div>

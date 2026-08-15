@@ -14,6 +14,7 @@ export function DealCard({ deal, rank, bestTotal }: Props) {
   const { listing, store, cost, alsoAt, reasons, match } = deal;
   const isBest = rank === 0;
   const delta = cost.total - bestTotal;
+  const mapUrl = `https://www.openstreetmap.org/?mlat=${store.coords.lat}&mlon=${store.coords.lon}#map=18/${store.coords.lat}/${store.coords.lon}`;
 
   return (
     <li
@@ -34,7 +35,11 @@ export function DealCard({ deal, rank, bestTotal }: Props) {
                 className="text-xs font-semibold px-2 py-0.5 rounded-full"
                 style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
               >
-                Best overall
+                {listing.inStock === false
+                  ? 'Best unavailable listing'
+                  : listing.inStock === true
+                    ? 'Best overall'
+                    : 'Best listed option'}
               </span>
             )}
             {listing.oldPrice && listing.oldPrice > listing.price && (
@@ -71,7 +76,21 @@ export function DealCard({ deal, rank, bestTotal }: Props) {
           <p className="text-sm" style={{ color: 'var(--faint)' }}>
             {cost.distanceKm} km · ~{cost.minutesOneWay} min each way
             {store.address ? ` · ${store.address}` : ''}
-            {alsoAt.length > 0 ? ` · +${alsoAt.length} more branch${alsoAt.length === 1 ? '' : 'es'}` : ''}
+            {' · '}
+            <a
+              href={mapUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline decoration-dotted underline-offset-2 hover:opacity-70"
+              aria-label={`Open ${store.name} on OpenStreetMap`}
+            >
+              Map
+            </a>
+            {alsoAt.length > 0
+              ? ` · +${alsoAt.length} mapped branch${
+                  alsoAt.length === 1 ? '' : 'es'
+                } (stock unverified)`
+              : ''}
           </p>
         </div>
 
@@ -98,7 +117,7 @@ export function DealCard({ deal, rank, bestTotal }: Props) {
               cost.travel
             )} + time ${formatKzt(cost.timeCost)}`}
           >
-            {formatKzt(cost.total)} all-in
+            {formatKzt(cost.total)} estimated all-in
           </div>
           {!isBest && delta > 0 && (
             <div className="text-xs mt-0.5 tabular-nums" style={{ color: 'var(--faint)' }}>

@@ -6,7 +6,7 @@ import { SearchForm } from '@/components/SearchForm';
 import { useAgentSearch } from '@/lib/useAgentSearch';
 
 export default function Home() {
-  const { state, run, cancel } = useAgentSearch();
+  const { state, run, cancel, retry, canRetry } = useAgentSearch();
   const { deals, summary } = state;
 
   return (
@@ -47,7 +47,12 @@ export default function Home() {
           style={{ borderColor: 'var(--warn)', color: 'var(--warn)' }}
           role="alert"
         >
-          {state.error}
+          <p>{state.error}</p>
+          {canRetry && (
+            <button type="button" className="btn btn-ghost mt-3" onClick={retry}>
+              Retry search
+            </button>
+          )}
         </div>
       )}
 
@@ -105,7 +110,7 @@ export default function Home() {
             {summary.storesFound === 1 ? '' : 's'} across {summary.domainsQueried}{' '}
             retailer site{summary.domainsQueried === 1 ? '' : 's'} in{' '}
             {summary.tookMs < 1000
-              ? `${summary.tookMs} ms (cached)`
+              ? `${summary.tookMs} ms`
               : `${(summary.tookMs / 1000).toFixed(1)}s`}
             . Read {summary.listingsSeen}{' '}
             listing{summary.listingsSeen === 1 ? '' : 's'}, {summary.listingsMatched}{' '}
@@ -126,8 +131,9 @@ export default function Home() {
           )}
           <p className="mt-2">
             Shop locations from OpenStreetMap. Prices are read from each
-            retailer&apos;s public website and may lag the shelf — always confirm
-            before travelling.
+            retailer&apos;s public website and may lag the shelf. Travel and time
+            costs are estimates, and branch stock is not verified — always
+            confirm before travelling.
           </p>
         </footer>
       )}
